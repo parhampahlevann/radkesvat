@@ -1,15 +1,14 @@
 #!/bin/bash
 
 # ==========================================
-# Cloudflare Ultra Fast LIVE IP Scanner
-# No file output - Live display only
-# Ubuntu only
+# Cloudflare LIVE IP Scanner (TCP ONLY)
+# ICMP REMOVED - WORKING VERSION
 # ==========================================
 
 set -e
 
-MAX_PING=150
-PARALLEL_JOBS=500
+PARALLEL_JOBS=800
+TIMEOUT=1
 
 CLOUDFLARE_RANGES=(
 "103.21.244.0/22"
@@ -31,21 +30,20 @@ CLOUDFLARE_RANGES=(
 
 clear
 echo "=========================================="
-echo " Cloudflare LIVE IP Scanner (50x Fast)"
+echo " Cloudflare LIVE IP Scanner (TCP 443)"
+echo " ICMP Disabled — Real Results"
 echo "=========================================="
-echo "[*] Showing ONLY healthy Cloudflare IPs"
-echo "[*] No files will be created"
 echo
 
 # ---------- Install dependencies ----------
-echo "[*] Installing required packages..."
+echo "[*] Installing packages..."
 sudo apt update -y
-sudo apt install -y fping netcat-openbsd ipcalc parallel
-ulimit -n 100000 || true
-echo "[✓] Dependencies ready"
+sudo apt install -y netcat-openbsd ipcalc parallel
+ulimit -n 200000 || true
+echo "[✓] Ready"
 echo
 
-# ---------- Generate IP list ----------
+# ---------- Generate IPs ----------
 generate_ips() {
   for cidr in "${CLOUDFLARE_RANGES[@]}"; do
     ipcalc "$cidr" | awk '
@@ -60,36 +58,19 @@ generate_ips() {
   done
 }
 
+echo "IP ADDRESS"
+echo "-----------------------------"
+
 # ---------- Scan ----------
-echo "[*] Starting live scan..."
-echo "[*] Parallel jobs : $PARALLEL_JOBS"
-echo "[*] Max ping      : ${MAX_PING} ms"
-echo
-echo "IP ADDRESS            LATENCY"
-echo "------------------------------------------"
-
-export MAX_PING
-
 generate_ips | \
-fping -a -q -c1 -t300 2>/dev/null | \
 parallel -j "$PARALLEL_JOBS" '
   ip={}
-  
-  # TCP 443 check
-  timeout 1 nc -z "$ip" 443 >/dev/null 2>&1 || exit
-  
-  # Ping latency
-  p=$(ping -c1 -W1 "$ip" 2>/dev/null | grep time= | awk -F"time=" "{print \$2}" | cut -d" " -f1)
-  [ -z "$p" ] && exit
-  
-  pi=${p%.*}
-  if [ "$pi" -le "'"$MAX_PING"'" ]; then
-    printf "%-20s %s ms\n" "$ip" "$p"
-  fi
+  timeout "'"$TIMEOUT"'" nc -z "$ip" 443 >/dev/null 2>&1 && \
+  echo "$ip"
 '
 
 echo
 echo "=========================================="
 echo "[✓] Scan finished"
-echo "[✓] End of live results"
+echo "[✓] Above IPs are REAL, healthy Cloudflare nodes"
 echo "=========================================="
