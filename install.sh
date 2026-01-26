@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # ==========================================
-# Cloudflare Ultra Fast IP Scanner (Ubuntu)
-# Single-file installer + runner
+# Cloudflare Ultra Fast LIVE IP Scanner
+# No file output - Live display only
+# Ubuntu only
 # ==========================================
 
 set -e
 
-OUTPUT="cloudflare_alive_ips.txt"
 MAX_PING=150
 PARALLEL_JOBS=500
 
@@ -31,22 +31,21 @@ CLOUDFLARE_RANGES=(
 
 clear
 echo "=========================================="
-echo " Cloudflare Ultra Fast IP Scanner (50x)"
+echo " Cloudflare LIVE IP Scanner (50x Fast)"
 echo "=========================================="
+echo "[*] Showing ONLY healthy Cloudflare IPs"
+echo "[*] No files will be created"
 echo
 
-# -------- Install dependencies ----------
+# ---------- Install dependencies ----------
 echo "[*] Installing required packages..."
 sudo apt update -y
 sudo apt install -y fping netcat-openbsd ipcalc parallel
-
-# Increase file descriptor limit
 ulimit -n 100000 || true
-
-echo "[✓] Dependencies installed"
+echo "[✓] Dependencies ready"
 echo
 
-# -------- Generate IP list ----------
+# ---------- Generate IP list ----------
 generate_ips() {
   for cidr in "${CLOUDFLARE_RANGES[@]}"; do
     ipcalc "$cidr" | awk '
@@ -61,16 +60,15 @@ generate_ips() {
   done
 }
 
-# -------- Scan ----------
-echo "[*] Starting Cloudflare scan"
+# ---------- Scan ----------
+echo "[*] Starting live scan..."
 echo "[*] Parallel jobs : $PARALLEL_JOBS"
 echo "[*] Max ping      : ${MAX_PING} ms"
-echo "[*] Output file   : $OUTPUT"
 echo
+echo "IP ADDRESS            LATENCY"
+echo "------------------------------------------"
 
-> "$OUTPUT"
-
-export OUTPUT MAX_PING
+export MAX_PING
 
 generate_ips | \
 fping -a -q -c1 -t300 2>/dev/null | \
@@ -80,20 +78,18 @@ parallel -j "$PARALLEL_JOBS" '
   # TCP 443 check
   timeout 1 nc -z "$ip" 443 >/dev/null 2>&1 || exit
   
-  # Ping latency check
+  # Ping latency
   p=$(ping -c1 -W1 "$ip" 2>/dev/null | grep time= | awk -F"time=" "{print \$2}" | cut -d" " -f1)
   [ -z "$p" ] && exit
   
   pi=${p%.*}
   if [ "$pi" -le "'"$MAX_PING"'" ]; then
-    echo "$ip ping=${p}ms" >> "'"$OUTPUT"'"
-    echo "[OK] $ip  ${p}ms"
+    printf "%-20s %s ms\n" "$ip" "$p"
   fi
 '
 
 echo
 echo "=========================================="
-echo "[✓] Scan completed successfully"
-echo "[✓] Healthy Cloudflare IPs saved in:"
-echo "    $OUTPUT"
+echo "[✓] Scan finished"
+echo "[✓] End of live results"
 echo "=========================================="
