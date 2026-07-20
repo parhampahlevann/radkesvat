@@ -1,38 +1,39 @@
 #!/bin/bash
 # ==========================================================
 # TCP Tunnel Optimizer & Auto-Recovery — v2 (Smart Edition)
-# سازگار با Rathole / Backhaul / هر تانل مبتنی بر systemd
+# Compatible with Rathole / Backhaul / any systemd-managed TCP tunnel
 #
-# چه فرقی با نسخه قبل داره؟
-#  - سرویس تانل و آدرس سرور مقابل رو خودش از کانفیگ پیدا می‌کنه
-#  - چک سلامت واقعی روی پورت TCP انجام میشه (نه فقط ping که
-#    خیلی جاها ICMP بلاکه و گزارش غلط میده)
-#  - MTU رو حدس نمی‌زنه، با تست واقعی path-MTU discovery پیدا می‌کنه
-#  - جلوی «restart storm» رو با backoff نمایی می‌گیره
-#  - لاگ‌ها rotate میشن تا دیسک پر نشه
-#  - idempotent هست: چند بار اجرا کنی خراب نمی‌کنه
+# What this does:
+#  - Auto-detects the tunnel service and its config file
+#  - Real TCP-port health checks (not just ICMP ping, which many
+#    hosts block, causing false positives)
+#  - Finds the real path MTU via binary-search probing instead of
+#    guessing a fixed number
+#  - Exponential backoff to prevent restart storms
+#  - Log rotation so logs don't fill up the disk
+#  - Idempotent: safe to run multiple times
 # ==========================================================
 
 set -euo pipefail
 
 if [ "$EUID" -ne 0 ]; then
-  echo "لطفاً با sudo یا root اجرا کن."
+  echo "Please run this script as root or with sudo."
   exit 1
 fi
 
 log()  { echo -e "\e[36m[*]\e[0m $1"; }
-ok()   { echo -e "\e[32m[✔]\e[0m $1"; }
-warn() { echo -e "\e[33m[⚠]\e[0m $1"; }
-err()  { echo -e "\e[31m[✘]\e[0m $1"; }
+ok()   { echo -e "\e[32m[OK]\e[0m $1"; }
+warn() { echo -e "\e[33m[WARN]\e[0m $1"; }
+err()  { echo -e "\e[31m[ERROR]\e[0m $1"; }
 
 echo "=============================================="
-echo "  Tunnel Optimizer v2 — شروع"
+echo "  Tunnel Optimizer v2 — starting"
 echo "=============================================="
 
 # ----------------------------------------------------------
-# بخش ۰: تشخیص خودکار سرویس تانل (rathole/backhaul) و کانفیگش
+# Step 0: Auto-detect the tunnel service (rathole/backhaul) and config
 # ----------------------------------------------------------
-log "در حال جستجوی سرویس تانل ..."
+log "Searching for the tunnel service ..."
 
 DETECTED_SERVICE=""
 for name in rathole backhaul; do
@@ -43,84 +44,84 @@ for name in rathole backhaul; do
 done
 
 if [ -n "$DETECTED_SERVICE" ]; then
-  ok "سرویس پیدا شد: $DETECTED_SERVICE"
-  read -rp "اسم سرویس رو تایید می‌کنی؟ [Enter برای تایید یا اسم درست رو بنویس]: " INPUT_SERVICE
+  ok "Found service: $DETECTED_SERVICE"
+  read -rp "Confirm service name [press Enter to accept, or type the correct name]: " INPUT_SERVICE
   TUNNEL_SERVICE="${INPUT_SERVICE:-$DETECTED_SERVICE}"
 else
-  warn "سرویس‌شناسی خودکار چیزی پیدا نکرد."
-  read -rp "اسم دقیق سرویس systemd تانلت رو وارد کن: " TUNNEL_SERVICE
+  warn "Auto-detection found nothing."
+  read -rp "Enter the exact systemd service name for your tunnel: " TUNNEL_SERVICE
 fi
 
 if ! systemctl list-unit-files | grep -q "^${TUNNEL_SERVICE}.service"; then
-  err "سرویسی به اسم ${TUNNEL_SERVICE} در systemd پیدا نشد."
-  err "اگه با nohup/screen اجراش می‌کنی، اول باید براش systemd unit بسازی. این اسکریپت بدون اون نمی‌تونه ری‌استارت خودکار انجام بده."
+  err "No service named ${TUNNEL_SERVICE} found in systemd."
+  err "If you're running it with nohup/screen, you need a systemd unit first — auto-restart can't work without one."
   exit 1
 fi
 
-# تلاش برای پیدا کردن کانفیگ و استخراج آدرس/پورت سرور مقابل
+# Try to locate config and extract the remote endpoint
 CONFIG_CANDIDATES=$(find /etc /opt /root -maxdepth 4 \( -iname "*rathole*" -o -iname "*backhaul*" \) \( -iname "*.toml" -o -iname "*.json" -o -iname "*.yaml" -o -iname "*.yml" -o -iname "*.conf" \) 2>/dev/null || true)
 
 REMOTE_HOST=""
 REMOTE_PORT=""
 
 if [ -n "$CONFIG_CANDIDATES" ]; then
-  log "فایل‌های کانفیگ پیدا شده:"
+  log "Found config file(s):"
   echo "$CONFIG_CANDIDATES" | sed 's/^/    /'
-  # الگوی رایج: remote_addr = "1.2.3.4:2333"  یا  "server": "1.2.3.4:2333"
+  # Common pattern: remote_addr = "1.2.3.4:2333"  or  "server": "1.2.3.4:2333"
   GUESS=$(grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}' $CONFIG_CANDIDATES 2>/dev/null | head -n1 || true)
   if [ -n "$GUESS" ]; then
     REMOTE_HOST="${GUESS%%:*}"
     REMOTE_PORT="${GUESS##*:}"
-    ok "حدس زده شد: $REMOTE_HOST:$REMOTE_PORT"
+    ok "Guessed endpoint: $REMOTE_HOST:$REMOTE_PORT"
   fi
 fi
 
-read -rp "IP سرور مقابل [${REMOTE_HOST:-وارد کن}]: " INPUT_HOST
+read -rp "Remote server IP [${REMOTE_HOST:-enter it}]: " INPUT_HOST
 REMOTE_HOST="${INPUT_HOST:-$REMOTE_HOST}"
-read -rp "پورت TCP تانل روی سرور مقابل [${REMOTE_PORT:-وارد کن}]: " INPUT_PORT
+read -rp "Remote tunnel TCP port [${REMOTE_PORT:-enter it}]: " INPUT_PORT
 REMOTE_PORT="${INPUT_PORT:-$REMOTE_PORT}"
 
 if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_PORT" ]; then
-  err "بدون IP و پورت سرور مقابل نمی‌تونم چک سلامت واقعی انجام بدم."
+  err "Can't do real health checks without the remote host and port."
   exit 1
 fi
 
-ok "هدف مانیتورینگ: ${REMOTE_HOST}:${REMOTE_PORT}  |  سرویس: ${TUNNEL_SERVICE}"
+ok "Monitoring target: ${REMOTE_HOST}:${REMOTE_PORT}  |  Service: ${TUNNEL_SERVICE}"
 
 # ----------------------------------------------------------
-# بخش ۱: بهینه‌سازی کرنل
+# Step 1: Kernel network tuning
 # ----------------------------------------------------------
 echo ""
-log "[1/5] اعمال تنظیمات شبکه کرنل ..."
+log "[1/5] Applying kernel network tuning ..."
 
 SYSCTL_FILE="/etc/sysctl.d/99-tunnel-optimizer.conf"
 
-# بررسی این‌که ماژول BBR در دسترسه یا نه (بعضی کرنل‌های مینیمال ندارنش)
+# Check whether BBR is available (some minimal kernels lack it)
 modprobe tcp_bbr 2>/dev/null || true
 if [ -f /proc/sys/net/ipv4/tcp_available_congestion_control ] && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
   CC_ALGO="bbr"
   QDISC="fq"
-  ok "BBR در دسترسه، ازش استفاده می‌کنیم."
+  ok "BBR is available, using it."
 else
   CC_ALGO="cubic"
   QDISC="fq_codel"
-  warn "BBR در دسترس نیست، روی cubic + fq_codel می‌مونیم."
+  warn "BBR not available, falling back to cubic + fq_codel."
 fi
 
 cat > "$SYSCTL_FILE" << EOF
-# --- TCP Keepalive: کانکشن رو زنده نگه می‌داره حتی موقع بی‌کاری ---
+# --- TCP keepalive: keeps the connection alive even during idle periods ---
 net.ipv4.tcp_keepalive_time = 20
 net.ipv4.tcp_keepalive_intvl = 8
 net.ipv4.tcp_keepalive_probes = 5
 
-# --- جلوگیری از افت throughput بعد از idle (خیلی از قطعی‌های تانل از همینه) ---
+# --- Prevents throughput collapse after idle (a common cause of tunnel drops) ---
 net.ipv4.tcp_slow_start_after_idle = 0
 
-# --- کاهش زمان اتصالات نیمه‌بسته ---
+# --- Faster cleanup of half-closed connections ---
 net.ipv4.tcp_fin_timeout = 20
 net.ipv4.tcp_tw_reuse = 1
 
-# --- بافر شبکه بزرگ‌تر برای ترافیک VPN ---
+# --- Larger network buffers for VPN traffic ---
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 87380 67108864
@@ -129,46 +130,46 @@ net.core.netdev_max_backlog = 250000
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 
-# --- کنترل ازدحام و صف‌بندی مدرن ---
+# --- Modern congestion control and queueing ---
 net.core.default_qdisc = ${QDISC}
 net.ipv4.tcp_congestion_control = ${CC_ALGO}
 
-# --- ریکاوری سریع‌تر در صورت افت لینک، به جای هنگ‌کردن طولانی ---
+# --- Faster recovery on link drops instead of long hangs ---
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_synack_retries = 3
 net.ipv4.tcp_retries2 = 6
 
-# --- Path MTU Discovery فعال، برای جلوگیری از drop شدن پکت به خاطر fragmentation ---
+# --- Path MTU discovery, to avoid packet drops from fragmentation ---
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_base_mss = 1024
 
-# --- فایل‌ها و پورت‌های بیشتر برای اتصالات همزمان ---
+# --- More open files and ports for concurrent connections ---
 fs.file-max = 2097152
 net.ipv4.ip_local_port_range = 1024 65535
 
-# --- IPv6 keepalive هم اگه تانل روی v6 باشه ---
+# --- IPv6 keepalive too, in case the tunnel runs over v6 ---
 net.ipv6.conf.all.disable_ipv6 = 0
 EOF
 
-sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "بعضی مقادیر شاید نیاز به ماژول اضافه داشته باشن، مشکلی نیست."
+sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "Some values may need an extra kernel module — that's fine."
 
-# nf_conntrack فقط اگه ماژولش لود شده باشه تنظیم کن (وگرنه sysctl ارور میده)
+# Only configure nf_conntrack if the module is actually loaded (otherwise sysctl errors out)
 if lsmod | grep -q nf_conntrack || modprobe nf_conntrack 2>/dev/null; then
   cat >> "$SYSCTL_FILE" << 'EOF'
 net.netfilter.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_tcp_timeout_established = 1200
 EOF
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-  ok "تنظیمات conntrack هم اضافه شد."
+  ok "conntrack tuning added as well."
 fi
 
-ok "تنظیمات کرنل اعمال شد (congestion control: ${CC_ALGO})."
+ok "Kernel tuning applied (congestion control: ${CC_ALGO})."
 
 # ----------------------------------------------------------
-# بخش ۲: پیدا کردن MTU واقعی با تست path-MTU (نه حدس)
+# Step 2: Find the real MTU via path-MTU testing (not a guess)
 # ----------------------------------------------------------
 echo ""
-log "[2/5] تست واقعی MTU مسیر به سمت ${REMOTE_HOST} ..."
+log "[2/5] Testing real path MTU to ${REMOTE_HOST} ..."
 
 IFACE=$(ip route get "$REMOTE_HOST" 2>/dev/null | grep -oP 'dev \K[^ ]+' | head -n1)
 if [ -z "$IFACE" ]; then
@@ -194,26 +195,26 @@ if [ -n "$IFACE" ]; then
   DETECTED_MTU=$(find_mtu || echo "1420")
   if [ "$DETECTED_MTU" -lt 1200 ]; then
     DETECTED_MTU=1420
-    warn "تست MTU نتیجه غیرمنطقی داد، مقدار پیش‌فرض امن 1420 استفاده میشه."
+    warn "MTU test gave an unreasonable result, using safe default 1420."
   fi
   ip link set dev "$IFACE" mtu "$DETECTED_MTU" 2>/dev/null && \
-    ok "MTU واقعی مسیر: ${DETECTED_MTU} — روی $IFACE اعمال شد." || \
-    warn "نتونستم MTU رو ست کنم، دستی بزن: ip link set dev $IFACE mtu $DETECTED_MTU"
+    ok "Real path MTU: ${DETECTED_MTU} — applied on $IFACE." || \
+    warn "Couldn't set MTU automatically, run manually: ip link set dev $IFACE mtu $DETECTED_MTU"
 else
-  warn "اینترفیس شبکه پیدا نشد، این مرحله رد شد."
+  warn "No network interface found, skipping this step."
 fi
 
 # ----------------------------------------------------------
-# بخش ۳: واچ‌داگ هوشمند با چک TCP واقعی + backoff نمایی
+# Step 3: Smart watchdog with real TCP checks + exponential backoff
 # ----------------------------------------------------------
 echo ""
-log "[3/5] نصب واچ‌داگ هوشمند ..."
+log "[3/5] Installing the smart watchdog ..."
 
 WATCHDOG_SCRIPT="/usr/local/bin/tunnel-watchdog.sh"
 cat > "$WATCHDOG_SCRIPT" << EOF
 #!/bin/bash
-# واچ‌داگ تانل: چک سلامت واقعی روی پورت TCP (نه فقط ping)
-# با backoff نمایی جلوی restart storm رو می‌گیره
+# Tunnel watchdog: real TCP-port health check (not just ping)
+# Uses exponential backoff to prevent restart storms
 
 SERVICE="${TUNNEL_SERVICE}"
 TARGET="${REMOTE_HOST}"
@@ -244,7 +245,7 @@ while true; do
     systemctl restart "\$SERVICE"
     FAIL_COUNT=0
     sleep "\$BACKOFF"
-    # افزایش نمایی backoff تا سقف مشخص، جلوی loop دیوونه‌وار رو می‌گیره
+    # Exponential backoff up to a cap, to avoid a runaway restart loop
     BACKOFF=\$(( BACKOFF * 2 ))
     [ "\$BACKOFF" -gt "\$MAX_BACKOFF" ] && BACKOFF=\$MAX_BACKOFF
     continue
@@ -272,7 +273,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# لاگ روتیشن، تا journal یا syslog با لاگ‌های ping/health پر نشه
+# Log rotation, so syslog doesn't fill up with health-check entries
 cat > /etc/logrotate.d/tunnel-watchdog << 'EOF'
 /var/log/syslog {
   weekly
@@ -283,13 +284,13 @@ cat > /etc/logrotate.d/tunnel-watchdog << 'EOF'
 }
 EOF
 
-ok "واچ‌داگ نصب شد."
+ok "Watchdog installed."
 
 # ----------------------------------------------------------
-# بخش ۴: Restart=always روی خود سرویس تانل (سطح systemd)
+# Step 4: Restart=always on the tunnel service itself (systemd level)
 # ----------------------------------------------------------
 echo ""
-log "[4/5] فعال‌سازی ری‌استارت خودکار در سطح systemd برای ${TUNNEL_SERVICE} ..."
+log "[4/5] Enabling systemd-level auto-restart for ${TUNNEL_SERVICE} ..."
 
 OVERRIDE_DIR="/etc/systemd/system/${TUNNEL_SERVICE}.service.d"
 mkdir -p "$OVERRIDE_DIR"
@@ -298,17 +299,17 @@ cat > "${OVERRIDE_DIR}/override.conf" << 'EOF'
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
-# باز کردن سقف فایل‌های باز برای اتصالات زیاد
+# Raise open-file limit for many concurrent connections
 LimitNOFILE=1048576
 EOF
 
-ok "override.conf برای ${TUNNEL_SERVICE} ساخته شد."
+ok "override.conf created for ${TUNNEL_SERVICE}."
 
 # ----------------------------------------------------------
-# بخش ۵: فعال‌سازی نهایی
+# Step 5: Final activation
 # ----------------------------------------------------------
 echo ""
-log "[5/5] فعال‌سازی سرویس‌ها ..."
+log "[5/5] Enabling services ..."
 
 systemctl daemon-reload
 systemctl enable --now tunnel-watchdog.service
@@ -316,15 +317,15 @@ systemctl restart "$TUNNEL_SERVICE"
 
 echo ""
 echo "=============================================="
-ok "بهینه‌سازی کامل شد"
+ok "Optimization complete"
 echo "=============================================="
 echo ""
-echo "دستورات مفید برای بررسی:"
-echo "  journalctl -u tunnel-watchdog -f       # لاگ زنده واچ‌داگ"
-echo "  systemctl status ${TUNNEL_SERVICE}     # وضعیت خود تانل"
-echo "  sysctl net.ipv4.tcp_congestion_control # چک الگوریتم فعال"
+echo "Useful commands to check status:"
+echo "  journalctl -u tunnel-watchdog -f       # live watchdog log"
+echo "  systemctl status ${TUNNEL_SERVICE}     # tunnel service status"
+echo "  sysctl net.ipv4.tcp_congestion_control # check active algorithm"
 echo ""
-echo "برای برداشتن کامل تغییرات:"
+echo "To fully undo these changes:"
 echo "  systemctl disable --now tunnel-watchdog"
 echo "  rm ${SYSCTL_FILE} ${WATCHDOG_SCRIPT} ${OVERRIDE_DIR}/override.conf"
 echo "  systemctl daemon-reload && sysctl --system"
