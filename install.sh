@@ -1,594 +1,330 @@
 #!/bin/bash
+# ==========================================================
+# TCP Tunnel Optimizer & Auto-Recovery — v2 (Smart Edition)
+# سازگار با Rathole / Backhaul / هر تانل مبتنی بر systemd
+#
+# چه فرقی با نسخه قبل داره؟
+#  - سرویس تانل و آدرس سرور مقابل رو خودش از کانفیگ پیدا می‌کنه
+#  - چک سلامت واقعی روی پورت TCP انجام میشه (نه فقط ping که
+#    خیلی جاها ICMP بلاکه و گزارش غلط میده)
+#  - MTU رو حدس نمی‌زنه، با تست واقعی path-MTU discovery پیدا می‌کنه
+#  - جلوی «restart storm» رو با backoff نمایی می‌گیره
+#  - لاگ‌ها rotate میشن تا دیسک پر نشه
+#  - idempotent هست: چند بار اجرا کنی خراب نمی‌کنه
+# ==========================================================
 
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v5
-# Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
-# Includes: fixed shared token, TLS cert auto-gen for wss/wssmux, port management,
-# per-service management console, and a BBR/network system optimizer.
-# Run this SEPARATELY on each server (Iran and Kharej). No SSH auto-sync — keep it simple.
-
-set -e
-
-REPO="Musixal/Backhaul"
-INSTALL_DIR="/root/backhaul-core"
-STATE_FILE="$INSTALL_DIR/state.env"
-FIXED_TOKEN="123"
+set -euo pipefail
 
 if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root (sudo)."
-    exit 1
+  echo "لطفاً با sudo یا root اجرا کن."
+  exit 1
 fi
 
-mkdir -p "$INSTALL_DIR"
+log()  { echo -e "\e[36m[*]\e[0m $1"; }
+ok()   { echo -e "\e[32m[✔]\e[0m $1"; }
+warn() { echo -e "\e[33m[⚠]\e[0m $1"; }
+err()  { echo -e "\e[31m[✘]\e[0m $1"; }
 
-# ============================================================
-# Helpers
-# ============================================================
+echo "=============================================="
+echo "  Tunnel Optimizer v2 — شروع"
+echo "=============================================="
 
-detect_public_ip() {
-    curl -fsSL -4 https://ifconfig.me 2>/dev/null || curl -fsSL -4 https://api.ipify.org 2>/dev/null || echo ""
-}
+# ----------------------------------------------------------
+# بخش ۰: تشخیص خودکار سرویس تانل (rathole/backhaul) و کانفیگش
+# ----------------------------------------------------------
+log "در حال جستجوی سرویس تانل ..."
 
-ensure_backhaul_local() {
-    mkdir -p "$INSTALL_DIR"
-    if [ -x "$INSTALL_DIR/backhaul" ]; then
-        return
-    fi
-    echo "Fetching latest official Backhaul release from GitHub..."
-    local arch asset_arch url attempt
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64) asset_arch="amd64" ;;
-        aarch64) asset_arch="arm64" ;;
-        *) echo "Unsupported architecture: $arch"; exit 1 ;;
-    esac
-    url=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep "browser_download_url" | grep "linux_${asset_arch}" | grep -v ".sha256" \
-        | head -n1 | cut -d '"' -f4)
-    if [ -z "$url" ]; then
-        echo "Could not resolve a release asset automatically."
-        read -p "Paste the correct .tar.gz download URL: " url
-    fi
+DETECTED_SERVICE=""
+for name in rathole backhaul; do
+  if systemctl list-unit-files 2>/dev/null | grep -qi "^${name}"; then
+    DETECTED_SERVICE=$(systemctl list-unit-files | grep -i "^${name}" | head -n1 | awk '{print $1}' | sed 's/\.service$//')
+    break
+  fi
+done
 
-    rm -f "$INSTALL_DIR/backhaul.tar.gz"
-    attempt=0
-    until curl -fSL --retry 3 --retry-delay 2 -o "$INSTALL_DIR/backhaul.tar.gz" "$url"; do
-        attempt=$((attempt + 1))
-        if [ "$attempt" -ge 3 ]; then
-            echo "Download failed after multiple attempts."
-            echo "Check disk space (df -h) and network access, then try again."
-            exit 1
-        fi
-        echo "Retrying download..."
-        sleep 2
-    done
+if [ -n "$DETECTED_SERVICE" ]; then
+  ok "سرویس پیدا شد: $DETECTED_SERVICE"
+  read -rp "اسم سرویس رو تایید می‌کنی؟ [Enter برای تایید یا اسم درست رو بنویس]: " INPUT_SERVICE
+  TUNNEL_SERVICE="${INPUT_SERVICE:-$DETECTED_SERVICE}"
+else
+  warn "سرویس‌شناسی خودکار چیزی پیدا نکرد."
+  read -rp "اسم دقیق سرویس systemd تانلت رو وارد کن: " TUNNEL_SERVICE
+fi
 
-    if [ ! -s "$INSTALL_DIR/backhaul.tar.gz" ]; then
-        echo "Downloaded file is empty — aborting."
-        exit 1
-    fi
+if ! systemctl list-unit-files | grep -q "^${TUNNEL_SERVICE}.service"; then
+  err "سرویسی به اسم ${TUNNEL_SERVICE} در systemd پیدا نشد."
+  err "اگه با nohup/screen اجراش می‌کنی، اول باید براش systemd unit بسازی. این اسکریپت بدون اون نمی‌تونه ری‌استارت خودکار انجام بده."
+  exit 1
+fi
 
-    if ! tar -tzf "$INSTALL_DIR/backhaul.tar.gz" >/dev/null 2>&1; then
-        echo "Downloaded file is not a valid archive — aborting. Try re-running."
-        rm -f "$INSTALL_DIR/backhaul.tar.gz"
-        exit 1
-    fi
+# تلاش برای پیدا کردن کانفیگ و استخراج آدرس/پورت سرور مقابل
+CONFIG_CANDIDATES=$(find /etc /opt /root -maxdepth 4 \( -iname "*rathole*" -o -iname "*backhaul*" \) \( -iname "*.toml" -o -iname "*.json" -o -iname "*.yaml" -o -iname "*.yml" -o -iname "*.conf" \) 2>/dev/null || true)
 
-    tar -xzf "$INSTALL_DIR/backhaul.tar.gz" -C "$INSTALL_DIR"
-    rm -f "$INSTALL_DIR/backhaul.tar.gz"
-    chmod +x "$INSTALL_DIR/backhaul"
-    echo "Backhaul binary installed."
-}
+REMOTE_HOST=""
+REMOTE_PORT=""
 
-ensure_tls_cert_local() {
-    # wss/wssmux require tls_cert/tls_key on the server side.
-    if [ -f "$INSTALL_DIR/server.crt" ] && [ -f "$INSTALL_DIR/server.key" ]; then
-        return
-    fi
-    echo "Generating self-signed TLS certificate for wss/wssmux..."
-    openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout "$INSTALL_DIR/server.key" -out "$INSTALL_DIR/server.crt" \
-        -days 3650 -subj "/CN=backhaul" >/dev/null 2>&1
-}
+if [ -n "$CONFIG_CANDIDATES" ]; then
+  log "فایل‌های کانفیگ پیدا شده:"
+  echo "$CONFIG_CANDIDATES" | sed 's/^/    /'
+  # الگوی رایج: remote_addr = "1.2.3.4:2333"  یا  "server": "1.2.3.4:2333"
+  GUESS=$(grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}' $CONFIG_CANDIDATES 2>/dev/null | head -n1 || true)
+  if [ -n "$GUESS" ]; then
+    REMOTE_HOST="${GUESS%%:*}"
+    REMOTE_PORT="${GUESS##*:}"
+    ok "حدس زده شد: $REMOTE_HOST:$REMOTE_PORT"
+  fi
+fi
 
-gen_port() {
-    echo $(( (RANDOM % 40000) + 20000 ))
-}
+read -rp "IP سرور مقابل [${REMOTE_HOST:-وارد کن}]: " INPUT_HOST
+REMOTE_HOST="${INPUT_HOST:-$REMOTE_HOST}"
+read -rp "پورت TCP تانل روی سرور مقابل [${REMOTE_PORT:-وارد کن}]: " INPUT_PORT
+REMOTE_PORT="${INPUT_PORT:-$REMOTE_PORT}"
 
-# ============================================================
-# System Optimizer (BBR + network sysctl tuning)
-# ============================================================
+if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_PORT" ]; then
+  err "بدون IP و پورت سرور مقابل نمی‌تونم چک سلامت واقعی انجام بدم."
+  exit 1
+fi
 
-optimize_system() {
-    echo ""
-    echo "=== System Optimization ==="
-    local INTERFACE
-    INTERFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-    [ -z "$INTERFACE" ] && INTERFACE=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
-    [ -z "$INTERFACE" ] && INTERFACE="eth0"
-    echo "Interface: $INTERFACE"
+ok "هدف مانیتورینگ: ${REMOTE_HOST}:${REMOTE_PORT}  |  سرویس: ${TUNNEL_SERVICE}"
 
-    sysctl -w net.core.rmem_max=8388608 > /dev/null 2>&1
-    sysctl -w net.core.wmem_max=8388608 > /dev/null 2>&1
-    sysctl -w net.core.rmem_default=131072 > /dev/null 2>&1
-    sysctl -w net.core.wmem_default=131072 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_rmem="4096 65536 8388608" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 8388608" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_retries2=6 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_syn_retries=2 > /dev/null 2>&1
-    sysctl -w net.core.netdev_max_backlog=1000 > /dev/null 2>&1
-    sysctl -w net.core.somaxconn=512 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_no_metrics_save=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_time=120 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_probes=3 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+# ----------------------------------------------------------
+# بخش ۱: بهینه‌سازی کرنل
+# ----------------------------------------------------------
+echo ""
+log "[1/5] اعمال تنظیمات شبکه کرنل ..."
 
-    if modprobe tcp_bbr 2>/dev/null; then
-        sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
-        sysctl -w net.core.default_qdisc=fq_codel > /dev/null 2>&1
-        echo "BBR congestion control enabled."
-    else
-        echo "BBR module not available on this kernel — staying on the default (usually CUBIC)."
-    fi
+SYSCTL_FILE="/etc/sysctl.d/99-tunnel-optimizer.conf"
 
-    tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
-    if tc qdisc add dev "$INTERFACE" root fq_codel limit 500 target 3ms interval 50ms quantum 300 ecn 2>/dev/null; then
-        echo "fq_codel queueing discipline applied on $INTERFACE."
-    else
-        echo "fq_codel setup skipped (not critical)."
-    fi
+# بررسی این‌که ماژول BBR در دسترسه یا نه (بعضی کرنل‌های مینیمال ندارنش)
+modprobe tcp_bbr 2>/dev/null || true
+if [ -f /proc/sys/net/ipv4/tcp_available_congestion_control ] && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+  CC_ALGO="bbr"
+  QDISC="fq"
+  ok "BBR در دسترسه، ازش استفاده می‌کنیم."
+else
+  CC_ALGO="cubic"
+  QDISC="fq_codel"
+  warn "BBR در دسترس نیست، روی cubic + fq_codel می‌مونیم."
+fi
 
-    cat > /etc/sysctl.d/99-backhaul-tunnel.conf << EOF
-net.core.rmem_max=8388608
-net.core.wmem_max=8388608
-net.core.rmem_default=131072
-net.core.wmem_default=131072
-net.ipv4.tcp_rmem=4096 65536 8388608
-net.ipv4.tcp_wmem=4096 65536 8388608
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_retries2=6
-net.ipv4.tcp_syn_retries=2
-net.core.netdev_max_backlog=1000
-net.core.somaxconn=512
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_low_latency=1
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_no_metrics_save=1
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_keepalive_time=120
-net.ipv4.tcp_keepalive_intvl=10
-net.ipv4.tcp_keepalive_probes=3
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq_codel
-net.ipv4.ip_forward=1
-EOF
-    echo "Saved to /etc/sysctl.d/99-backhaul-tunnel.conf (persists across reboots)."
-    echo "Optimization complete."
-}
+cat > "$SYSCTL_FILE" << EOF
+# --- TCP Keepalive: کانکشن رو زنده نگه می‌داره حتی موقع بی‌کاری ---
+net.ipv4.tcp_keepalive_time = 20
+net.ipv4.tcp_keepalive_intvl = 8
+net.ipv4.tcp_keepalive_probes = 5
 
-# ============================================================
-# Status
-# ============================================================
+# --- جلوگیری از افت throughput بعد از idle (خیلی از قطعی‌های تانل از همینه) ---
+net.ipv4.tcp_slow_start_after_idle = 0
 
-show_status() {
-    echo ""
-    echo "=== Backhaul services ==="
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
-    if [ -z "$units" ]; then
-        echo "No Backhaul services found."
-    else
-        for u in $units; do
-            echo "--- $u ---"
-            systemctl status "$u" --no-pager -l | head -n 6
-            echo ""
-        done
-    fi
+# --- کاهش زمان اتصالات نیمه‌بسته ---
+net.ipv4.tcp_fin_timeout = 20
+net.ipv4.tcp_tw_reuse = 1
 
-    echo "=== Recent warnings (token mismatch / connection issues) ==="
-    local found_warning=0
-    for u in $units; do
-        local warn
-        warn=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed" | tail -n 3)
-        if [ -n "$warn" ]; then
-            found_warning=1
-            echo "--- $u ---"
-            echo "$warn"
-        fi
-    done
-    if [ "$found_warning" = "0" ]; then
-        echo "None found in the last 20 log lines of each service."
-    else
-        echo ""
-        echo "If you see 'invalid security token', the token in the .toml files on the"
-        echo "two servers does not match — check with: grep token ${INSTALL_DIR}/*.toml"
-    fi
-}
+# --- بافر شبکه بزرگ‌تر برای ترافیک VPN ---
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
 
-# ============================================================
-# Manage inbound ports (Iran server side only)
-# ============================================================
+# --- کنترل ازدحام و صف‌بندی مدرن ---
+net.core.default_qdisc = ${QDISC}
+net.ipv4.tcp_congestion_control = ${CC_ALGO}
 
-manage_ports() {
-    local tomls
-    tomls=$(ls "$INSTALL_DIR"/iran*.toml 2>/dev/null || true)
-    if [ -z "$tomls" ]; then
-        echo "No Iran server config found on this machine. Run this on the Iran server."
-        return
-    fi
+# --- ریکاوری سریع‌تر در صورت افت لینک، به جای هنگ‌کردن طولانی ---
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_retries2 = 6
 
-    echo "Found config(s):"
-    select TOML_FILE in $tomls; do
-        [ -n "$TOML_FILE" ] && break
-        echo "Invalid selection."
-    done
+# --- Path MTU Discovery فعال، برای جلوگیری از drop شدن پکت به خاطر fragmentation ---
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
 
-    echo ""
-    echo "Current ports:"
-    sed -n '/ports = \[/,/\]/p' "$TOML_FILE"
+# --- فایل‌ها و پورت‌های بیشتر برای اتصالات همزمان ---
+fs.file-max = 2097152
+net.ipv4.ip_local_port_range = 1024 65535
 
-    echo ""
-    echo "1) Add a port"
-    echo "2) Remove a port"
-    read -p "Choice [1-2]: " PCHOICE
-
-    PORT_NUM=$(basename "$TOML_FILE" | grep -oE '[0-9]+' | head -n1)
-    SERVICE_NAME="backhaul-iran${PORT_NUM}.service"
-
-    if [ "$PCHOICE" = "1" ]; then
-        read -p "Port to add: " NEWPORT
-        sed -i "s/\]/    \"${NEWPORT}\"\n]/" "$TOML_FILE"
-        # normalize: ensure previous last line got a trailing comma
-        python3 - "$TOML_FILE" << 'PYEOF' 2>/dev/null || true
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-lines = content.split("\n")
-out = []
-in_ports = False
-port_lines_idx = []
-for i, l in enumerate(lines):
-    if 'ports = [' in l:
-        in_ports = True
-    if in_ports and l.strip().startswith('"'):
-        port_lines_idx.append(i)
-    if in_ports and l.strip() == ']':
-        in_ports = False
-for idx_pos, i in enumerate(port_lines_idx):
-    l = lines[i].rstrip(',').rstrip()
-    if idx_pos != len(port_lines_idx) - 1:
-        lines[i] = l + ","
-    else:
-        lines[i] = l
-with open(path, "w") as f:
-    f.write("\n".join(lines))
-PYEOF
-        echo "Added port ${NEWPORT}."
-    else
-        read -p "Port to remove: " OLDPORT
-        sed -i "/\"${OLDPORT}\"/d" "$TOML_FILE"
-        echo "Removed port ${OLDPORT}."
-    fi
-
-    systemctl restart "$SERVICE_NAME"
-    echo "Restarted $SERVICE_NAME."
-}
-
-# ============================================================
-# Service management (start/stop/restart/logs/enable/disable/edit)
-# ============================================================
-
-manage_services() {
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
-    if [ -z "$units" ]; then
-        echo "No Backhaul services found on this server."
-        return
-    fi
-
-    echo ""
-    echo "Select a service to manage:"
-    select SERVICE_NAME in $units; do
-        [ -n "$SERVICE_NAME" ] && break
-        echo "Invalid selection."
-    done
-
-    local TOML_FILE
-    TOML_FILE=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "/etc/systemd/system/${SERVICE_NAME}" | head -n1)
-
-    while true; do
-        echo ""
-        echo "=== $SERVICE_NAME ==="
-        systemctl is-active --quiet "$SERVICE_NAME" && echo "Status: RUNNING" || echo "Status: STOPPED"
-        systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && echo "Auto-start: enabled" || echo "Auto-start: disabled"
-        echo ""
-        echo "1) Start"
-        echo "2) Stop"
-        echo "3) Restart"
-        echo "4) Full status"
-        echo "5) Live logs (Ctrl+C to exit)"
-        echo "6) Enable auto-start"
-        echo "7) Disable auto-start"
-        echo "8) View config"
-        echo "9) Edit config"
-        echo "10) Delete this service"
-        echo "0) Back"
-        read -p "Select: " SCHOICE
-        case "$SCHOICE" in
-            1) systemctl start "$SERVICE_NAME"; echo "Started." ;;
-            2) systemctl stop "$SERVICE_NAME"; echo "Stopped." ;;
-            3) systemctl restart "$SERVICE_NAME"; echo "Restarted." ;;
-            4) systemctl status "$SERVICE_NAME" --no-pager -l ;;
-            5) journalctl -u "$SERVICE_NAME" -f ;;
-            6) systemctl enable "$SERVICE_NAME"; echo "Enabled." ;;
-            7) systemctl disable "$SERVICE_NAME"; echo "Disabled." ;;
-            8) [ -n "$TOML_FILE" ] && cat "$TOML_FILE" || echo "Config path not found." ;;
-            9) if [ -n "$TOML_FILE" ]; then
-                   ${EDITOR:-nano} "$TOML_FILE"
-                   read -p "Restart service to apply changes? (y/n): " R
-                   [ "$R" = "y" ] && systemctl restart "$SERVICE_NAME" && echo "Restarted."
-               else
-                   echo "Config path not found."
-               fi ;;
-            10) read -p "Delete $SERVICE_NAME and its config? (y/n): " D
-                if [ "$D" = "y" ]; then
-                    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-                    rm -f "/etc/systemd/system/${SERVICE_NAME}"
-                    [ -n "$TOML_FILE" ] && rm -f "$TOML_FILE"
-                    systemctl daemon-reload
-                    echo "Deleted."
-                    return
-                fi ;;
-            0) return ;;
-            *) echo "Invalid option." ;;
-        esac
-    done
-}
-
-# ============================================================
-# Uninstall
-# ============================================================
-
-uninstall_all() {
-    read -p "This will remove ALL Backhaul services on THIS server. Continue? (y/n): " CONFIRM
-    if [ "$CONFIRM" != "y" ]; then
-        echo "Cancelled."
-        return
-    fi
-
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
-    for u in $units; do
-        systemctl disable --now "$u" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/$u"
-    done
-
-    systemctl daemon-reload
-    rm -rf "$INSTALL_DIR"
-    echo "Uninstalled."
-}
-
-# ============================================================
-# Install
-# ============================================================
-
-install_flow() {
-    mkdir -p "$INSTALL_DIR"
-    echo ""
-    echo "Are you setting up the Iran server or the Kharej server?"
-    select LOCAL_ROLE in "Iran" "Kharej"; do
-        case $LOCAL_ROLE in
-            Iran|Kharej) break;;
-            *) echo "Invalid selection.";;
-        esac
-    done
-
-    LOCAL_PUBLIC_IP_GUESS=$(detect_public_ip)
-    read -p "This server's public IP [${LOCAL_PUBLIC_IP_GUESS}]: " LOCAL_PUBLIC_IP
-    LOCAL_PUBLIC_IP=${LOCAL_PUBLIC_IP:-$LOCAL_PUBLIC_IP_GUESS}
-
-    read -p "The OTHER server's public IP: " PEER_PUBLIC_IP
-
-    echo ""
-    echo "Choose transport:"
-    echo "  1) wss     - TLS encrypted, looks like HTTPS to firewalls (recommended)"
-    echo "  2) wssmux  - wss + multiplexing, best for many concurrent connections / high throughput"
-    echo "  3) tcp     - plain TCP, fastest but not encrypted or disguised"
-    echo "  4) tcpmux  - tcp + multiplexing"
-    read -p "Enter choice [1-4] (default 1): " TRANSPORT_CHOICE
-    case "$TRANSPORT_CHOICE" in
-        2) TRANSPORT="wssmux" ;;
-        3) TRANSPORT="tcp" ;;
-        4) TRANSPORT="tcpmux" ;;
-        *) TRANSPORT="wss" ;;
-    esac
-
-    # Token is fixed (as requested) — same on both servers, no prompt needed.
-    # NOTE: this is much weaker than a random token. Anyone who guesses/knows
-    # "123" can authenticate to your tunnel. Fine for quick testing, but
-    # consider a random token (openssl rand -hex 24) for anything real.
-    TOKEN="$FIXED_TOKEN"
-
-    # Tunnel port still has to match on both sides. Iran picks/generates it;
-    # Kharej must type in EXACTLY the same port Iran is using.
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        TUNNEL_PORT_DEFAULT=$(gen_port)
-        read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
-        TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
-        read -p "Inbound ports on the Iran server (comma separated, e.g. 2050,2023): " INBOUND_PORTS
-        IRAN_IP="$LOCAL_PUBLIC_IP"; KHAREJ_IP="$PEER_PUBLIC_IP"
-        echo ""
-        echo ">>> Tunnel port: $TUNNEL_PORT   (token is fixed: $TOKEN)"
-        echo ">>> Enter this EXACT port when you run this script on the Kharej server."
-    else
-        echo ""
-        echo "This MUST exactly match the port shown on the Iran server."
-        read -p "Enter the tunnel port used on the Iran server: " TUNNEL_PORT
-        KHAREJ_IP="$LOCAL_PUBLIC_IP"; IRAN_IP="$PEER_PUBLIC_IP"
-    fi
-
-    ensure_backhaul_local
-    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-        if [ "$LOCAL_ROLE" = "Iran" ]; then
-            ensure_tls_cert_local
-        fi
-    fi
-
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        TOML_FILE="$INSTALL_DIR/iran${TUNNEL_PORT}.toml"
-        {
-            echo "[server]"
-            echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
-            echo "transport = \"${TRANSPORT}\""
-            echo "token = \"${TOKEN}\""
-            echo "keepalive_period = 75"
-            echo "nodelay = true"
-            echo "channel_size = 2048"
-            echo "heartbeat = 40"
-            echo "mux_con = 8"
-            if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-                echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
-                echo "tls_key = \"${INSTALL_DIR}/server.key\""
-            fi
-            echo "sniffer = false"
-            echo "web_port = 0"
-            echo "log_level = \"info\""
-            echo ""
-            echo "ports = ["
-        } > "$TOML_FILE"
-        IFS=',' read -ra PORT_ARRAY <<< "$INBOUND_PORTS"
-        for i in "${!PORT_ARRAY[@]}"; do
-            port=$(echo "${PORT_ARRAY[i]}" | xargs)
-            if [ $((i+1)) -eq ${#PORT_ARRAY[@]} ]; then
-                echo "    \"${port}\"" >> "$TOML_FILE"
-            else
-                echo "    \"${port}\"," >> "$TOML_FILE"
-            fi
-        done
-        echo "]" >> "$TOML_FILE"
-
-        SERVICE_FILE="/etc/systemd/system/backhaul-iran${TUNNEL_PORT}.service"
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Backhaul Iran Server Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${TOML_FILE}
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-iran${TUNNEL_PORT}.service"
-        echo "Local Backhaul (Iran server side) started on port ${TUNNEL_PORT}."
-    else
-        TOML_FILE="$INSTALL_DIR/kharej${TUNNEL_PORT}.toml"
-        cat > "$TOML_FILE" << EOF
-[client]
-remote_addr = "${IRAN_IP}:${TUNNEL_PORT}"
-transport = "${TRANSPORT}"
-token = "${TOKEN}"
-connection_pool = 8
-aggressive_pool = false
-keepalive_period = 75
-nodelay = true
-retry_interval = 3
-sniffer = false
-web_port = 0
-log_level = "info"
-EOF
-        SERVICE_FILE="/etc/systemd/system/backhaul-kharej${TUNNEL_PORT}.service"
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Backhaul Kharej Client Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${TOML_FILE}
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-kharej${TUNNEL_PORT}.service"
-        echo "Local Backhaul (Kharej client side) started, connecting to ${IRAN_IP}:${TUNNEL_PORT}."
-    fi
-
-    cat > "$STATE_FILE" << EOF
-LOCAL_ROLE=${LOCAL_ROLE}
-TUNNEL_PORT=${TUNNEL_PORT}
-IRAN_IP=${IRAN_IP}
-KHAREJ_IP=${KHAREJ_IP}
-TRANSPORT=${TRANSPORT}
+# --- IPv6 keepalive هم اگه تانل روی v6 باشه ---
+net.ipv6.conf.all.disable_ipv6 = 0
 EOF
 
-    echo ""
-    echo "=== Setup Completed! ==="
-    echo "Tunnel port: $TUNNEL_PORT"
-    echo "Token: $TOKEN"
-    echo "Check: systemctl status 'backhaul-*'"
-    if [ "$TOKEN" = "123" ]; then
-        echo "(Reminder: token is the fixed value '123' — fine for testing, weak for production.)"
-    fi
+sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "بعضی مقادیر شاید نیاز به ماژول اضافه داشته باشن، مشکلی نیست."
 
-    read -p "Run system optimizer now (BBR + network tuning)? (y/n): " RUNOPT
-    [ "$RUNOPT" = "y" ] && optimize_system
+# nf_conntrack فقط اگه ماژولش لود شده باشه تنظیم کن (وگرنه sysctl ارور میده)
+if lsmod | grep -q nf_conntrack || modprobe nf_conntrack 2>/dev/null; then
+  cat >> "$SYSCTL_FILE" << 'EOF'
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 1200
+EOF
+  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+  ok "تنظیمات conntrack هم اضافه شد."
+fi
+
+ok "تنظیمات کرنل اعمال شد (congestion control: ${CC_ALGO})."
+
+# ----------------------------------------------------------
+# بخش ۲: پیدا کردن MTU واقعی با تست path-MTU (نه حدس)
+# ----------------------------------------------------------
+echo ""
+log "[2/5] تست واقعی MTU مسیر به سمت ${REMOTE_HOST} ..."
+
+IFACE=$(ip route get "$REMOTE_HOST" 2>/dev/null | grep -oP 'dev \K[^ ]+' | head -n1)
+if [ -z "$IFACE" ]; then
+  IFACE=$(ip route | awk '/default/ {print $5; exit}')
+fi
+
+find_mtu() {
+  local low=1200 high=1500 size=1500 best=1200
+  while [ $((high - low)) -gt 10 ]; do
+    size=$(( (low + high) / 2 ))
+    payload=$((size - 28))
+    if ping -c 1 -W 1 -M do -s "$payload" "$REMOTE_HOST" > /dev/null 2>&1; then
+      best=$size
+      low=$size
+    else
+      high=$size
+    fi
+  done
+  echo "$best"
 }
 
-# ============================================================
-# Menu
-# ============================================================
+if [ -n "$IFACE" ]; then
+  DETECTED_MTU=$(find_mtu || echo "1420")
+  if [ "$DETECTED_MTU" -lt 1200 ]; then
+    DETECTED_MTU=1420
+    warn "تست MTU نتیجه غیرمنطقی داد، مقدار پیش‌فرض امن 1420 استفاده میشه."
+  fi
+  ip link set dev "$IFACE" mtu "$DETECTED_MTU" 2>/dev/null && \
+    ok "MTU واقعی مسیر: ${DETECTED_MTU} — روی $IFACE اعمال شد." || \
+    warn "نتونستم MTU رو ست کنم، دستی بزن: ip link set dev $IFACE mtu $DETECTED_MTU"
+else
+  warn "اینترفیس شبکه پیدا نشد، این مرحله رد شد."
+fi
+
+# ----------------------------------------------------------
+# بخش ۳: واچ‌داگ هوشمند با چک TCP واقعی + backoff نمایی
+# ----------------------------------------------------------
+echo ""
+log "[3/5] نصب واچ‌داگ هوشمند ..."
+
+WATCHDOG_SCRIPT="/usr/local/bin/tunnel-watchdog.sh"
+cat > "$WATCHDOG_SCRIPT" << EOF
+#!/bin/bash
+# واچ‌داگ تانل: چک سلامت واقعی روی پورت TCP (نه فقط ping)
+# با backoff نمایی جلوی restart storm رو می‌گیره
+
+SERVICE="${TUNNEL_SERVICE}"
+TARGET="${REMOTE_HOST}"
+PORT="${REMOTE_PORT}"
+FAIL_COUNT=0
+MAX_FAIL=3
+BACKOFF=5
+MAX_BACKOFF=300
+
+check_health() {
+  timeout 3 bash -c "echo > /dev/tcp/\${TARGET}/\${PORT}" 2>/dev/null
+}
 
 while true; do
-    echo ""
-    echo "==== Backhaul Tunnel Manager ===="
-    echo "1) Install / Setup tunnel"
-    echo "2) Show tunnel status"
-    echo "3) Manage inbound ports (Iran side)"
-    echo "4) Manage services (start/stop/restart/logs/edit)"
-    echo "5) System optimizer (BBR + network tuning)"
-    echo "6) Uninstall tunnel"
-    echo "7) Exit"
-    read -p "Select an option [1-7]: " CHOICE
-    case "$CHOICE" in
-        1) install_flow ;;
-        2) show_status ;;
-        3) manage_ports ;;
-        4) manage_services ;;
-        5) optimize_system ;;
-        6) uninstall_all ;;
-        7) exit 0 ;;
-        *) echo "Invalid option." ;;
-    esac
+  if check_health; then
+    if [ "\$FAIL_COUNT" -gt 0 ]; then
+      logger -t tunnel-watchdog "connection recovered, resetting fail counter"
+    fi
+    FAIL_COUNT=0
+    BACKOFF=5
+  else
+    FAIL_COUNT=\$((FAIL_COUNT + 1))
+    logger -t tunnel-watchdog "health check failed (\$FAIL_COUNT/\$MAX_FAIL) -> \${TARGET}:\${PORT}"
+  fi
+
+  if [ "\$FAIL_COUNT" -ge "\$MAX_FAIL" ]; then
+    logger -t tunnel-watchdog "restarting \$SERVICE (backoff: \${BACKOFF}s)"
+    systemctl restart "\$SERVICE"
+    FAIL_COUNT=0
+    sleep "\$BACKOFF"
+    # افزایش نمایی backoff تا سقف مشخص، جلوی loop دیوونه‌وار رو می‌گیره
+    BACKOFF=\$(( BACKOFF * 2 ))
+    [ "\$BACKOFF" -gt "\$MAX_BACKOFF" ] && BACKOFF=\$MAX_BACKOFF
+    continue
+  fi
+
+  sleep 8
 done
+EOF
+
+chmod +x "$WATCHDOG_SCRIPT"
+
+cat > /etc/systemd/system/tunnel-watchdog.service << EOF
+[Unit]
+Description=Smart Tunnel Watchdog (TCP health-check + auto restart)
+After=network-online.target ${TUNNEL_SERVICE}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${WATCHDOG_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# لاگ روتیشن، تا journal یا syslog با لاگ‌های ping/health پر نشه
+cat > /etc/logrotate.d/tunnel-watchdog << 'EOF'
+/var/log/syslog {
+  weekly
+  rotate 4
+  compress
+  missingok
+  notifempty
+}
+EOF
+
+ok "واچ‌داگ نصب شد."
+
+# ----------------------------------------------------------
+# بخش ۴: Restart=always روی خود سرویس تانل (سطح systemd)
+# ----------------------------------------------------------
+echo ""
+log "[4/5] فعال‌سازی ری‌استارت خودکار در سطح systemd برای ${TUNNEL_SERVICE} ..."
+
+OVERRIDE_DIR="/etc/systemd/system/${TUNNEL_SERVICE}.service.d"
+mkdir -p "$OVERRIDE_DIR"
+cat > "${OVERRIDE_DIR}/override.conf" << 'EOF'
+[Service]
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+# باز کردن سقف فایل‌های باز برای اتصالات زیاد
+LimitNOFILE=1048576
+EOF
+
+ok "override.conf برای ${TUNNEL_SERVICE} ساخته شد."
+
+# ----------------------------------------------------------
+# بخش ۵: فعال‌سازی نهایی
+# ----------------------------------------------------------
+echo ""
+log "[5/5] فعال‌سازی سرویس‌ها ..."
+
+systemctl daemon-reload
+systemctl enable --now tunnel-watchdog.service
+systemctl restart "$TUNNEL_SERVICE"
+
+echo ""
+echo "=============================================="
+ok "بهینه‌سازی کامل شد"
+echo "=============================================="
+echo ""
+echo "دستورات مفید برای بررسی:"
+echo "  journalctl -u tunnel-watchdog -f       # لاگ زنده واچ‌داگ"
+echo "  systemctl status ${TUNNEL_SERVICE}     # وضعیت خود تانل"
+echo "  sysctl net.ipv4.tcp_congestion_control # چک الگوریتم فعال"
+echo ""
+echo "برای برداشتن کامل تغییرات:"
+echo "  systemctl disable --now tunnel-watchdog"
+echo "  rm ${SYSCTL_FILE} ${WATCHDOG_SCRIPT} ${OVERRIDE_DIR}/override.conf"
+echo "  systemctl daemon-reload && sysctl --system"
