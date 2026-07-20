@@ -1,127 +1,94 @@
 #!/bin/bash
 # ==========================================================
-# TCP Tunnel Optimizer & Auto-Recovery — v2 (Smart Edition)
-# Compatible with Rathole / Backhaul / any systemd-managed TCP tunnel
+# Universal Connection Stabilizer v3
+# Works on any server, with any tunnel/VPN software (or none).
+# Doesn't need to know what tunnel you're running.
 #
-# What this does:
-#  - Auto-detects the tunnel service and its config file
-#  - Real TCP-port health checks (not just ICMP ping, which many
-#    hosts block, causing false positives)
-#  - Finds the real path MTU via binary-search probing instead of
-#    guessing a fixed number
-#  - Exponential backoff to prevent restart storms
-#  - Log rotation so logs don't fill up the disk
-#  - Idempotent: safe to run multiple times
+# Usage:
+#   sudo ./stabilizer.sh install                       # kernel tuning only
+#   sudo ./stabilizer.sh install --service NAME         # + watchdog for a
+#                                                          specific systemd
+#                                                          service
+#   sudo ./stabilizer.sh install --service NAME \
+#                                --target HOST --port PORT
+#                                                        # + real TCP health
+#                                                          checks against a
+#                                                          remote endpoint
+#   sudo ./stabilizer.sh status                          # verify everything
+#   sudo ./stabilizer.sh uninstall                       # revert all changes
 # ==========================================================
 
 set -euo pipefail
 
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run this script as root or with sudo."
-  exit 1
-fi
+SYSCTL_FILE="/etc/sysctl.d/99-stabilizer.conf"
+WATCHDOG_SCRIPT="/usr/local/bin/conn-watchdog.sh"
+WATCHDOG_SERVICE="/etc/systemd/system/conn-watchdog.service"
+STATE_FILE="/etc/stabilizer.state"
+LOGROTATE_FILE="/etc/logrotate.d/conn-watchdog"
 
 log()  { echo -e "\e[36m[*]\e[0m $1"; }
 ok()   { echo -e "\e[32m[OK]\e[0m $1"; }
 warn() { echo -e "\e[33m[WARN]\e[0m $1"; }
-err()  { echo -e "\e[31m[ERROR]\e[0m $1"; }
+err()  { echo -e "\e[31m[FAIL]\e[0m $1"; }
 
-echo "=============================================="
-echo "  Tunnel Optimizer v2 — starting"
-echo "=============================================="
-
-# ----------------------------------------------------------
-# Step 0: Auto-detect the tunnel service (rathole/backhaul) and config
-# ----------------------------------------------------------
-log "Searching for the tunnel service ..."
-
-DETECTED_SERVICE=""
-for name in rathole backhaul; do
-  if systemctl list-unit-files 2>/dev/null | grep -qi "^${name}"; then
-    DETECTED_SERVICE=$(systemctl list-unit-files | grep -i "^${name}" | head -n1 | awk '{print $1}' | sed 's/\.service$//')
-    break
+require_root() {
+  if [ "$EUID" -ne 0 ]; then
+    err "Run this as root or with sudo."
+    exit 1
   fi
-done
+}
 
-if [ -n "$DETECTED_SERVICE" ]; then
-  ok "Found service: $DETECTED_SERVICE"
-  read -rp "Confirm service name [press Enter to accept, or type the correct name]: " INPUT_SERVICE
-  TUNNEL_SERVICE="${INPUT_SERVICE:-$DETECTED_SERVICE}"
-else
-  warn "Auto-detection found nothing."
-  read -rp "Enter the exact systemd service name for your tunnel: " TUNNEL_SERVICE
-fi
+# ==========================================================
+# INSTALL
+# ==========================================================
+do_install() {
+  require_root
 
-if ! systemctl list-unit-files | grep -q "^${TUNNEL_SERVICE}.service"; then
-  err "No service named ${TUNNEL_SERVICE} found in systemd."
-  err "If you're running it with nohup/screen, you need a systemd unit first — auto-restart can't work without one."
-  exit 1
-fi
+  SERVICE=""
+  TARGET=""
+  PORT=""
 
-# Try to locate config and extract the remote endpoint
-CONFIG_CANDIDATES=$(find /etc /opt /root -maxdepth 4 \( -iname "*rathole*" -o -iname "*backhaul*" \) \( -iname "*.toml" -o -iname "*.json" -o -iname "*.yaml" -o -iname "*.yml" -o -iname "*.conf" \) 2>/dev/null || true)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --service) SERVICE="$2"; shift 2 ;;
+      --target)  TARGET="$2"; shift 2 ;;
+      --port)    PORT="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
 
-REMOTE_HOST=""
-REMOTE_PORT=""
+  echo "=============================================="
+  echo "  Universal Connection Stabilizer — installing"
+  echo "=============================================="
 
-if [ -n "$CONFIG_CANDIDATES" ]; then
-  log "Found config file(s):"
-  echo "$CONFIG_CANDIDATES" | sed 's/^/    /'
-  # Common pattern: remote_addr = "1.2.3.4:2333"  or  "server": "1.2.3.4:2333"
-  GUESS=$(grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}' $CONFIG_CANDIDATES 2>/dev/null | head -n1 || true)
-  if [ -n "$GUESS" ]; then
-    REMOTE_HOST="${GUESS%%:*}"
-    REMOTE_PORT="${GUESS##*:}"
-    ok "Guessed endpoint: $REMOTE_HOST:$REMOTE_PORT"
+  # ------------------------------------------------------
+  # 1. Kernel / network tuning — always applied, tunnel-agnostic
+  # ------------------------------------------------------
+  log "[1/4] Applying kernel network tuning ..."
+
+  modprobe tcp_bbr 2>/dev/null || true
+  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    CC_ALGO="bbr"; QDISC="fq"
+    ok "BBR available, using it."
+  else
+    CC_ALGO="cubic"; QDISC="fq_codel"
+    warn "BBR not available, falling back to cubic + fq_codel."
   fi
-fi
 
-read -rp "Remote server IP [${REMOTE_HOST:-enter it}]: " INPUT_HOST
-REMOTE_HOST="${INPUT_HOST:-$REMOTE_HOST}"
-read -rp "Remote tunnel TCP port [${REMOTE_PORT:-enter it}]: " INPUT_PORT
-REMOTE_PORT="${INPUT_PORT:-$REMOTE_PORT}"
-
-if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_PORT" ]; then
-  err "Can't do real health checks without the remote host and port."
-  exit 1
-fi
-
-ok "Monitoring target: ${REMOTE_HOST}:${REMOTE_PORT}  |  Service: ${TUNNEL_SERVICE}"
-
-# ----------------------------------------------------------
-# Step 1: Kernel network tuning
-# ----------------------------------------------------------
-echo ""
-log "[1/5] Applying kernel network tuning ..."
-
-SYSCTL_FILE="/etc/sysctl.d/99-tunnel-optimizer.conf"
-
-# Check whether BBR is available (some minimal kernels lack it)
-modprobe tcp_bbr 2>/dev/null || true
-if [ -f /proc/sys/net/ipv4/tcp_available_congestion_control ] && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
-  CC_ALGO="bbr"
-  QDISC="fq"
-  ok "BBR is available, using it."
-else
-  CC_ALGO="cubic"
-  QDISC="fq_codel"
-  warn "BBR not available, falling back to cubic + fq_codel."
-fi
-
-cat > "$SYSCTL_FILE" << EOF
-# --- TCP keepalive: keeps the connection alive even during idle periods ---
+  cat > "$SYSCTL_FILE" << EOF
+# Keepalive: keeps idle connections from silently dying
 net.ipv4.tcp_keepalive_time = 20
 net.ipv4.tcp_keepalive_intvl = 8
 net.ipv4.tcp_keepalive_probes = 5
 
-# --- Prevents throughput collapse after idle (a common cause of tunnel drops) ---
+# Prevents throughput collapse after idle periods
 net.ipv4.tcp_slow_start_after_idle = 0
 
-# --- Faster cleanup of half-closed connections ---
+# Faster cleanup of half-closed sockets
 net.ipv4.tcp_fin_timeout = 20
 net.ipv4.tcp_tw_reuse = 1
 
-# --- Larger network buffers for VPN traffic ---
+# Larger buffers for tunneled/VPN traffic
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 87380 67108864
@@ -130,122 +97,124 @@ net.core.netdev_max_backlog = 250000
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 
-# --- Modern congestion control and queueing ---
+# Modern congestion control
 net.core.default_qdisc = ${QDISC}
 net.ipv4.tcp_congestion_control = ${CC_ALGO}
 
-# --- Faster recovery on link drops instead of long hangs ---
+# Faster recovery on link drops
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_synack_retries = 3
 net.ipv4.tcp_retries2 = 6
 
-# --- Path MTU discovery, to avoid packet drops from fragmentation ---
+# Path MTU discovery — avoids drops from fragmentation
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_base_mss = 1024
 
-# --- More open files and ports for concurrent connections ---
+# Headroom for many concurrent connections
 fs.file-max = 2097152
 net.ipv4.ip_local_port_range = 1024 65535
-
-# --- IPv6 keepalive too, in case the tunnel runs over v6 ---
-net.ipv6.conf.all.disable_ipv6 = 0
 EOF
 
-sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "Some values may need an extra kernel module — that's fine."
+  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "Some values may need an extra module — that's fine."
 
-# Only configure nf_conntrack if the module is actually loaded (otherwise sysctl errors out)
-if lsmod | grep -q nf_conntrack || modprobe nf_conntrack 2>/dev/null; then
-  cat >> "$SYSCTL_FILE" << 'EOF'
+  if lsmod | grep -q nf_conntrack || modprobe nf_conntrack 2>/dev/null; then
+    cat >> "$SYSCTL_FILE" << 'EOF'
 net.netfilter.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_tcp_timeout_established = 1200
 EOF
-  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-  ok "conntrack tuning added as well."
-fi
-
-ok "Kernel tuning applied (congestion control: ${CC_ALGO})."
-
-# ----------------------------------------------------------
-# Step 2: Find the real MTU via path-MTU testing (not a guess)
-# ----------------------------------------------------------
-echo ""
-log "[2/5] Testing real path MTU to ${REMOTE_HOST} ..."
-
-IFACE=$(ip route get "$REMOTE_HOST" 2>/dev/null | grep -oP 'dev \K[^ ]+' | head -n1)
-if [ -z "$IFACE" ]; then
-  IFACE=$(ip route | awk '/default/ {print $5; exit}')
-fi
-
-find_mtu() {
-  local low=1200 high=1500 size=1500 best=1200
-  while [ $((high - low)) -gt 10 ]; do
-    size=$(( (low + high) / 2 ))
-    payload=$((size - 28))
-    if ping -c 1 -W 1 -M do -s "$payload" "$REMOTE_HOST" > /dev/null 2>&1; then
-      best=$size
-      low=$size
-    else
-      high=$size
-    fi
-  done
-  echo "$best"
-}
-
-if [ -n "$IFACE" ]; then
-  DETECTED_MTU=$(find_mtu || echo "1420")
-  if [ "$DETECTED_MTU" -lt 1200 ]; then
-    DETECTED_MTU=1420
-    warn "MTU test gave an unreasonable result, using safe default 1420."
+    sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
   fi
-  ip link set dev "$IFACE" mtu "$DETECTED_MTU" 2>/dev/null && \
-    ok "Real path MTU: ${DETECTED_MTU} — applied on $IFACE." || \
-    warn "Couldn't set MTU automatically, run manually: ip link set dev $IFACE mtu $DETECTED_MTU"
-else
-  warn "No network interface found, skipping this step."
-fi
 
-# ----------------------------------------------------------
-# Step 3: Smart watchdog with real TCP checks + exponential backoff
-# ----------------------------------------------------------
-echo ""
-log "[3/5] Installing the smart watchdog ..."
+  ok "Kernel tuning applied (congestion control: ${CC_ALGO})."
 
-WATCHDOG_SCRIPT="/usr/local/bin/tunnel-watchdog.sh"
-cat > "$WATCHDOG_SCRIPT" << EOF
+  # ------------------------------------------------------
+  # 2. MTU probing — generic, uses target if given, else the default gateway
+  # ------------------------------------------------------
+  echo ""
+  log "[2/4] Testing path MTU ..."
+
+  PROBE_HOST="${TARGET:-}"
+  if [ -z "$PROBE_HOST" ]; then
+    PROBE_HOST=$(ip route | awk '/default/ {print $3; exit}')
+  fi
+
+  IFACE=$(ip route | awk '/default/ {print $5; exit}')
+
+  find_mtu() {
+    local low=1200 high=1500 size best=1200
+    while [ $((high - low)) -gt 10 ]; do
+      size=$(( (low + high) / 2 ))
+      payload=$((size - 28))
+      if ping -c 1 -W 1 -M do -s "$payload" "$PROBE_HOST" > /dev/null 2>&1; then
+        best=$size; low=$size
+      else
+        high=$size
+      fi
+    done
+    echo "$best"
+  }
+
+  if [ -n "$PROBE_HOST" ] && [ -n "$IFACE" ]; then
+    DETECTED_MTU=$(find_mtu || echo "1420")
+    [ "$DETECTED_MTU" -lt 1200 ] && DETECTED_MTU=1420
+    ip link set dev "$IFACE" mtu "$DETECTED_MTU" 2>/dev/null && \
+      ok "MTU set to ${DETECTED_MTU} on $IFACE (probed against ${PROBE_HOST})." || \
+      warn "Could not set MTU automatically. Run manually: ip link set dev $IFACE mtu $DETECTED_MTU"
+  else
+    warn "No probe target or interface found, skipping MTU step."
+    DETECTED_MTU="skipped"
+  fi
+
+  # ------------------------------------------------------
+  # 3. Optional watchdog — only if a service was specified
+  # ------------------------------------------------------
+  echo ""
+  if [ -n "$SERVICE" ]; then
+    log "[3/4] Installing watchdog for service '${SERVICE}' ..."
+
+    if ! systemctl list-unit-files | grep -q "^${SERVICE}.service"; then
+      err "No systemd service named '${SERVICE}' found. Skipping watchdog."
+      SERVICE=""
+    else
+      cat > "$WATCHDOG_SCRIPT" << EOF
 #!/bin/bash
-# Tunnel watchdog: real TCP-port health check (not just ping)
-# Uses exponential backoff to prevent restart storms
-
-SERVICE="${TUNNEL_SERVICE}"
-TARGET="${REMOTE_HOST}"
-PORT="${REMOTE_PORT}"
+# Generic connection watchdog. Health check depends on what was configured:
+#  - if TARGET+PORT given: real TCP connect check
+#  - if only TARGET given: ICMP ping check
+#  - if nothing given: just checks the service is 'active' in systemd
+SERVICE="${SERVICE}"
+TARGET="${TARGET}"
+PORT="${PORT}"
 FAIL_COUNT=0
 MAX_FAIL=3
 BACKOFF=5
 MAX_BACKOFF=300
 
 check_health() {
-  timeout 3 bash -c "echo > /dev/tcp/\${TARGET}/\${PORT}" 2>/dev/null
+  if [ -n "\$TARGET" ] && [ -n "\$PORT" ]; then
+    timeout 3 bash -c "echo > /dev/tcp/\${TARGET}/\${PORT}" 2>/dev/null
+  elif [ -n "\$TARGET" ]; then
+    ping -c 1 -W 2 "\$TARGET" > /dev/null 2>&1
+  else
+    systemctl is-active --quiet "\$SERVICE"
+  fi
 }
 
 while true; do
   if check_health; then
-    if [ "\$FAIL_COUNT" -gt 0 ]; then
-      logger -t tunnel-watchdog "connection recovered, resetting fail counter"
-    fi
+    [ "\$FAIL_COUNT" -gt 0 ] && logger -t conn-watchdog "recovered, resetting counter"
     FAIL_COUNT=0
     BACKOFF=5
   else
     FAIL_COUNT=\$((FAIL_COUNT + 1))
-    logger -t tunnel-watchdog "health check failed (\$FAIL_COUNT/\$MAX_FAIL) -> \${TARGET}:\${PORT}"
+    logger -t conn-watchdog "health check failed (\$FAIL_COUNT/\$MAX_FAIL)"
   fi
 
   if [ "\$FAIL_COUNT" -ge "\$MAX_FAIL" ]; then
-    logger -t tunnel-watchdog "restarting \$SERVICE (backoff: \${BACKOFF}s)"
+    logger -t conn-watchdog "restarting \$SERVICE (backoff: \${BACKOFF}s)"
     systemctl restart "\$SERVICE"
     FAIL_COUNT=0
     sleep "\$BACKOFF"
-    # Exponential backoff up to a cap, to avoid a runaway restart loop
     BACKOFF=\$(( BACKOFF * 2 ))
     [ "\$BACKOFF" -gt "\$MAX_BACKOFF" ] && BACKOFF=\$MAX_BACKOFF
     continue
@@ -254,13 +223,12 @@ while true; do
   sleep 8
 done
 EOF
+      chmod +x "$WATCHDOG_SCRIPT"
 
-chmod +x "$WATCHDOG_SCRIPT"
-
-cat > /etc/systemd/system/tunnel-watchdog.service << EOF
+      cat > "$WATCHDOG_SERVICE" << EOF
 [Unit]
-Description=Smart Tunnel Watchdog (TCP health-check + auto restart)
-After=network-online.target ${TUNNEL_SERVICE}.service
+Description=Generic Connection Watchdog for ${SERVICE}
+After=network-online.target ${SERVICE}.service
 Wants=network-online.target
 
 [Service]
@@ -273,8 +241,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# Log rotation, so syslog doesn't fill up with health-check entries
-cat > /etc/logrotate.d/tunnel-watchdog << 'EOF'
+      cat > "$LOGROTATE_FILE" << 'EOF'
 /var/log/syslog {
   weekly
   rotate 4
@@ -284,48 +251,169 @@ cat > /etc/logrotate.d/tunnel-watchdog << 'EOF'
 }
 EOF
 
-ok "Watchdog installed."
-
-# ----------------------------------------------------------
-# Step 4: Restart=always on the tunnel service itself (systemd level)
-# ----------------------------------------------------------
-echo ""
-log "[4/5] Enabling systemd-level auto-restart for ${TUNNEL_SERVICE} ..."
-
-OVERRIDE_DIR="/etc/systemd/system/${TUNNEL_SERVICE}.service.d"
-mkdir -p "$OVERRIDE_DIR"
-cat > "${OVERRIDE_DIR}/override.conf" << 'EOF'
+      # Auto-restart at the systemd level for the target service too
+      OVERRIDE_DIR="/etc/systemd/system/${SERVICE}.service.d"
+      mkdir -p "$OVERRIDE_DIR"
+      cat > "${OVERRIDE_DIR}/override.conf" << 'EOF'
 [Service]
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
-# Raise open-file limit for many concurrent connections
 LimitNOFILE=1048576
 EOF
 
-ok "override.conf created for ${TUNNEL_SERVICE}."
+      systemctl daemon-reload
+      systemctl enable --now conn-watchdog.service
+      systemctl restart "$SERVICE" 2>/dev/null || true
+      ok "Watchdog installed and watching '${SERVICE}'."
+    fi
+  else
+    log "[3/4] No --service given, skipping watchdog (kernel tuning still applies system-wide)."
+  fi
 
-# ----------------------------------------------------------
-# Step 5: Final activation
-# ----------------------------------------------------------
-echo ""
-log "[5/5] Enabling services ..."
+  # ------------------------------------------------------
+  # 4. Save state for the status/uninstall commands
+  # ------------------------------------------------------
+  echo ""
+  log "[4/4] Saving install state ..."
+  cat > "$STATE_FILE" << EOF
+INSTALLED_AT=$(date -Iseconds)
+SERVICE=${SERVICE}
+TARGET=${TARGET}
+PORT=${PORT}
+IFACE=${IFACE:-}
+MTU=${DETECTED_MTU:-}
+CC_ALGO=${CC_ALGO}
+EOF
+  ok "State saved to ${STATE_FILE}."
 
-systemctl daemon-reload
-systemctl enable --now tunnel-watchdog.service
-systemctl restart "$TUNNEL_SERVICE"
+  echo ""
+  echo "=============================================="
+  ok "Install complete. Run: sudo $0 status"
+  echo "=============================================="
+}
 
-echo ""
-echo "=============================================="
-ok "Optimization complete"
-echo "=============================================="
-echo ""
-echo "Useful commands to check status:"
-echo "  journalctl -u tunnel-watchdog -f       # live watchdog log"
-echo "  systemctl status ${TUNNEL_SERVICE}     # tunnel service status"
-echo "  sysctl net.ipv4.tcp_congestion_control # check active algorithm"
-echo ""
-echo "To fully undo these changes:"
-echo "  systemctl disable --now tunnel-watchdog"
-echo "  rm ${SYSCTL_FILE} ${WATCHDOG_SCRIPT} ${OVERRIDE_DIR}/override.conf"
-echo "  systemctl daemon-reload && sysctl --system"
+# ==========================================================
+# STATUS
+# ==========================================================
+do_status() {
+  echo "=============================================="
+  echo "  Stabilizer Status Check"
+  echo "=============================================="
+
+  if [ ! -f "$STATE_FILE" ]; then
+    err "Not installed (no ${STATE_FILE} found). Run: sudo $0 install"
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  echo "Installed at : ${INSTALLED_AT:-unknown}"
+  echo ""
+
+  # sysctl check
+  if [ -f "$SYSCTL_FILE" ]; then
+    ok "sysctl config file present: $SYSCTL_FILE"
+  else
+    err "sysctl config file missing!"
+  fi
+
+  ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+  if [ "$ACTIVE_CC" = "${CC_ALGO:-}" ]; then
+    ok "Congestion control active: $ACTIVE_CC"
+  else
+    warn "Congestion control is '$ACTIVE_CC', expected '${CC_ALGO:-unknown}'."
+  fi
+
+  ACTIVE_KEEPALIVE=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "unknown")
+  echo "TCP keepalive time      : ${ACTIVE_KEEPALIVE}s"
+
+  # MTU check
+  if [ -n "${IFACE:-}" ]; then
+    CURRENT_MTU=$(ip link show "$IFACE" 2>/dev/null | grep -oP 'mtu \K[0-9]+' || echo "unknown")
+    echo "Interface $IFACE MTU     : $CURRENT_MTU (target was: ${MTU:-n/a})"
+  fi
+
+  echo ""
+
+  # Watchdog check
+  if [ -n "${SERVICE:-}" ]; then
+    echo "--- Watchdog for service: $SERVICE ---"
+    if systemctl is-active --quiet conn-watchdog.service; then
+      ok "conn-watchdog.service is running."
+    else
+      err "conn-watchdog.service is NOT running."
+    fi
+
+    if systemctl is-active --quiet "$SERVICE"; then
+      ok "$SERVICE is active."
+    else
+      err "$SERVICE is NOT active."
+    fi
+
+    if [ -f "/etc/systemd/system/${SERVICE}.service.d/override.conf" ]; then
+      ok "Auto-restart override present for $SERVICE."
+    else
+      warn "No auto-restart override found for $SERVICE."
+    fi
+
+    echo ""
+    echo "Last 5 watchdog log lines:"
+    journalctl -t conn-watchdog -n 5 --no-pager 2>/dev/null || echo "  (no logs yet)"
+  else
+    echo "No watchdog was configured (kernel tuning only)."
+  fi
+
+  echo ""
+  echo "=============================================="
+  echo "  Status check complete"
+  echo "=============================================="
+}
+
+# ==========================================================
+# UNINSTALL
+# ==========================================================
+do_uninstall() {
+  require_root
+
+  if [ ! -f "$STATE_FILE" ]; then
+    err "Nothing to uninstall — ${STATE_FILE} not found."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+
+  log "Reverting changes ..."
+
+  systemctl disable --now conn-watchdog.service 2>/dev/null || true
+  rm -f "$WATCHDOG_SCRIPT" "$WATCHDOG_SERVICE" "$LOGROTATE_FILE"
+
+  if [ -n "${SERVICE:-}" ] && [ -f "/etc/systemd/system/${SERVICE}.service.d/override.conf" ]; then
+    rm -f "/etc/systemd/system/${SERVICE}.service.d/override.conf"
+  fi
+
+  rm -f "$SYSCTL_FILE"
+  sysctl --system >/dev/null 2>&1 || true
+
+  rm -f "$STATE_FILE"
+  systemctl daemon-reload
+
+  ok "All changes reverted."
+}
+
+# ==========================================================
+# ENTRY POINT
+# ==========================================================
+case "${1:-}" in
+  install)   shift; do_install "$@" ;;
+  status)    do_status ;;
+  uninstall) do_uninstall ;;
+  *)
+    echo "Usage:"
+    echo "  sudo $0 install [--service NAME] [--target HOST] [--port PORT]"
+    echo "  sudo $0 status"
+    echo "  sudo $0 uninstall"
+    exit 1
+    ;;
+esac
