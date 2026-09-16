@@ -1,6 +1,12 @@
 #!/bin/bash
 # =============================================================================
-#  Backhaul Tunnel Manager  (Iran <-> Kharej)  —  v8.1
+#  Backhaul Tunnel Manager  (Iran <-> Kharej)  —  v8.2
+#
+#  v8.2 fixes
+#   * StartLimitIntervalSec moved from [Service] to [Unit] — modern systemd
+#     only accepts it there, so it was being ignored and spamming the journal
+#     with "Unknown key name" warnings. Existing unit files are migrated
+#     automatically when the script starts.
 #
 #  v8.1 fixes
 #   * The install directory is now re-created before every download/write, so
@@ -227,6 +233,8 @@ write_service() {  # unit-name description toml
 Description=$2
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -234,7 +242,6 @@ User=root
 ExecStart=${BIN} -c $3
 Restart=always
 RestartSec=1
-StartLimitIntervalSec=0
 LimitNOFILE=1048576
 TasksMax=infinity
 LimitMEMLOCK=infinity
@@ -245,6 +252,22 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+migrate_units() {  # v8.1 and older put StartLimit* in [Service] -> systemd ignores it
+    local f changed=0
+    for f in /etc/systemd/system/backhaul-*.service; do
+        [ -f "$f" ] || continue
+        if awk '/^\[Service\]/{s=1} s && /^StartLimit/{found=1} END{exit !found}' "$f"; then
+            sed -i '/^StartLimitIntervalSec=/d; /^StartLimitBurst=/d' "$f"
+            sed -i '0,/^\[Service\]/s//StartLimitIntervalSec=0\nStartLimitBurst=0\n\n[Service]/' "$f"
+            changed=1
+        fi
+    done
+    if [ "$changed" = "1" ]; then
+        systemctl daemon-reload
+        ok "Fixed StartLimitIntervalSec placement in existing unit files (systemd warning is gone)."
+    fi
 }
 
 # =============================================================================
@@ -851,10 +874,12 @@ uninstall_all() {
 # =============================================================================
 #  Main menu
 # =============================================================================
+migrate_units
+
 while true; do
     echo
     hr
-    echo -e "  ${CB}Backhaul Tunnel Manager — v8.1${C0}    services: $(list_units | grep -c .)"
+    echo -e "  ${CB}Backhaul Tunnel Manager — v8.2${C0}    services: $(list_units | grep -c .)"
     hr
     echo "  1) Install / add a tunnel"
     echo "  2) Status"
