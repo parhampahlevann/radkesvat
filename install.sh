@@ -1,136 +1,565 @@
 #!/bin/bash
-
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v7
-# Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
+# =============================================================================
+#  Backhaul Tunnel Manager  (Iran <-> Kharej)  —  v8
+#  Official Musixal/Backhaul release binary. Encrypted reverse port forwarding.
 #
-# v7 changes vs v6:
-#   - Rewritten sysctl profile (larger buffers/backlogs, BBR+fq, faster keepalive/timeouts)
-#   - Tighter server/client tunnel config (faster heartbeat, bigger channel, aggressive pool)
-#   - Hardened systemd unit (instant restart, no OOM kill, unlimited fds)
-#   - New watchdog: checks every 10s per-service, restarts on inactive service OR
-#     30s with zero established connections on the tunnel port
-#   - MTU pinned to 1400 on the default interface, persisted via a oneshot systemd unit
-#   - DNS pinned to 1.1.1.1 / 1.0.0.1 / 8.8.8.8 (static /etc/resolv.conf)
-#   - System-wide file descriptor limits raised (fs.file-max + limits.conf)
+#  WHAT CHANGED vs v7
+#   * Simpler menu (6 items) and a cleanly sectioned script.
+#   * NEW: one Kharej server (client) -> MANY Iran servers (server) at once.
+#          The client flow asks "how many Iran servers?", then IP + tunnel port
+#          for each, and creates one independent service per Iran server.
+#   * Service names are now unique per peer:
+#          backhaul-kharej-<ip>-<port>.service   /   backhaul-iran-<port>.service
+#   * New unit registry: /root/backhaul-core/units/*.env
+#     -> the watchdog no longer has to guess anything from systemd files.
+#   * Rewritten watchdog (see notes at the bottom of setup_watchdog):
+#       - 5s tick
+#       - per-PEER connection check (dst <ip>:<port>) so two tunnels that use
+#         the same port number are never mixed up
+#       - stall detection: TCP "unacked" on every socket = packet loss /
+#         black-holed link, even while the socket still looks ESTABLISHED
+#       - restart cooldown + start grace  -> no restart loops
+#       - pause flag: a service you stopped by hand stays stopped
+#       - automatic log rotation
+#   * Faster failure detection: heartbeat 10s, dial_timeout 5s, retry 1s,
+#     tcp_user_timeout 20s, keepalive 30/5/4.
 #
-# Run this SEPARATELY on each server (Iran and Kharej). No SSH auto-sync — keep it simple.
-
-set -e
+#  Run this SEPARATELY on every server (each Iran server + the Kharej server).
+# =============================================================================
 
 REPO="Musixal/Backhaul"
 INSTALL_DIR="/root/backhaul-core"
-STATE_FILE="$INSTALL_DIR/state.env"
+BIN="$INSTALL_DIR/backhaul"
+UNITS_DIR="$INSTALL_DIR/units"
+WD_DIR="$INSTALL_DIR/watchdog"
+WD_SCRIPT="$WD_DIR/watchdog.sh"
+WD_CONF="$WD_DIR/watchdog.conf"
+WD_LOG="$WD_DIR/watchdog.log"
+WD_STATE="$WD_DIR/state"
 FIXED_TOKEN="123"
-WATCHDOG_SCRIPT="$INSTALL_DIR/watchdog.sh"
-WATCHDOG_LOG="$INSTALL_DIR/watchdog.log"
-WATCHDOG_STATE_DIR="$INSTALL_DIR/watchdog-state"
-WATCHDOG_IDLE_THRESHOLD=30
+
+# ---- watchdog tuning (written to $WD_CONF, editable later) -------------------
+WD_TICK=5             # how often the watchdog runs (seconds)
+WD_IDLE=20            # seconds with 0 established connections -> restart
+WD_STALL=15           # seconds with all sockets unacked (packet loss) -> restart
+WD_COOLDOWN=60        # min seconds between two restarts of the same service
+WD_GRACE=45           # ignore a service for N seconds after it (re)starts
+
+# =============================================================================
+#  UI helpers
+# =============================================================================
+CG="\033[1;32m"; CR="\033[1;31m"; CY="\033[1;33m"; CB="\033[1;36m"; C0="\033[0m"
+ok()   { echo -e "${CG}[ ok ]${C0} $*"; }
+warn() { echo -e "${CY}[ !  ]${C0} $*"; }
+fail() { echo -e "${CR}[err ]${C0} $*"; }
+hr()   { echo "--------------------------------------------------------------"; }
+title(){ echo; hr; echo -e "  ${CB}$*${C0}"; hr; }
+
+ask() {  # ask "Question" "default"  -> prints the answer on stdout
+    local p="$1" d="$2" v
+    read -rp "$p${d:+ [$d]}: " v
+    echo "${v:-$d}"
+}
+confirm() { local a; read -rp "$1 [y/N]: " a; [[ "$a" =~ ^[Yy]$ ]]; }
+
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+slug()       { echo "${1//[^0-9A-Za-z]/-}"; }
+gen_port()   { echo $(( (RANDOM % 40000) + 20000 )); }
 
 if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root (sudo)."
+    fail "Please run as root (sudo)."
     exit 1
 fi
+mkdir -p "$INSTALL_DIR" "$UNITS_DIR" "$WD_DIR" "$WD_STATE"
 
-mkdir -p "$INSTALL_DIR"
-
-# ============================================================
-# Helpers
-# ============================================================
-
+# =============================================================================
+#  Detection / installation helpers
+# =============================================================================
 detect_public_ip() {
-    curl -fsSL -4 https://ifconfig.me 2>/dev/null || curl -fsSL -4 https://api.ipify.org 2>/dev/null || echo ""
+    curl -fsSL -4 --max-time 6 https://ifconfig.me 2>/dev/null \
+        || curl -fsSL -4 --max-time 6 https://api.ipify.org 2>/dev/null \
+        || echo ""
 }
 
 detect_default_iface() {
-    local iface
-    iface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-    [ -z "$iface" ] && iface=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
-    [ -z "$iface" ] && iface="eth0"
-    echo "$iface"
+    local i
+    i=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+    [ -z "$i" ] && i=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
+    [ -z "$i" ] && i="eth0"
+    echo "$i"
 }
 
-ensure_backhaul_local() {
-    mkdir -p "$INSTALL_DIR"
-    if [ -x "$INSTALL_DIR/backhaul" ]; then
-        return
-    fi
-    echo "Fetching latest official Backhaul release from GitHub..."
-    local arch asset_arch url attempt
+ensure_backhaul() {
+    [ -x "$BIN" ] && return 0
+    echo "Fetching the latest official Backhaul release..."
+    local arch asset url tries=0
     arch=$(uname -m)
     case "$arch" in
-        x86_64) asset_arch="amd64" ;;
-        aarch64) asset_arch="arm64" ;;
-        *) echo "Unsupported architecture: $arch"; exit 1 ;;
+        x86_64)  asset="amd64" ;;
+        aarch64) asset="arm64" ;;
+        *) fail "Unsupported architecture: $arch"; return 1 ;;
     esac
     url=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep "browser_download_url" | grep "linux_${asset_arch}" | grep -v ".sha256" \
+        | grep "browser_download_url" | grep "linux_${asset}" | grep -v ".sha256" \
         | head -n1 | cut -d '"' -f4)
-    if [ -z "$url" ]; then
-        echo "Could not resolve a release asset automatically."
-        read -p "Paste the correct .tar.gz download URL: " url
-    fi
+    [ -z "$url" ] && url=$(ask "Could not resolve the asset. Paste the .tar.gz URL" "")
+    [ -z "$url" ] && { fail "No download URL."; return 1; }
 
     rm -f "$INSTALL_DIR/backhaul.tar.gz"
-    attempt=0
     until curl -fSL --retry 3 --retry-delay 2 -o "$INSTALL_DIR/backhaul.tar.gz" "$url"; do
-        attempt=$((attempt + 1))
-        if [ "$attempt" -ge 3 ]; then
-            echo "Download failed after multiple attempts."
-            echo "Check disk space (df -h) and network access, then try again."
-            exit 1
-        fi
-        echo "Retrying download..."
-        sleep 2
+        tries=$((tries + 1))
+        [ "$tries" -ge 3 ] && { fail "Download failed (check disk space / network)."; return 1; }
+        echo "Retrying..."; sleep 2
     done
-
-    if [ ! -s "$INSTALL_DIR/backhaul.tar.gz" ]; then
-        echo "Downloaded file is empty — aborting."
-        exit 1
-    fi
-
     if ! tar -tzf "$INSTALL_DIR/backhaul.tar.gz" >/dev/null 2>&1; then
-        echo "Downloaded file is not a valid archive — aborting. Try re-running."
-        rm -f "$INSTALL_DIR/backhaul.tar.gz"
-        exit 1
+        fail "Downloaded file is not a valid archive."; rm -f "$INSTALL_DIR/backhaul.tar.gz"; return 1
     fi
-
     tar -xzf "$INSTALL_DIR/backhaul.tar.gz" -C "$INSTALL_DIR"
     rm -f "$INSTALL_DIR/backhaul.tar.gz"
-    chmod +x "$INSTALL_DIR/backhaul"
-    echo "Backhaul binary installed."
+    chmod +x "$BIN"
+    ok "Backhaul binary installed."
 }
 
-ensure_tls_cert_local() {
-    # wss/wssmux require tls_cert/tls_key on the server side.
-    if [ -f "$INSTALL_DIR/server.crt" ] && [ -f "$INSTALL_DIR/server.key" ]; then
-        return
-    fi
-    echo "Generating self-signed TLS certificate for wss/wssmux..."
+ensure_tls_cert() {
+    [ -f "$INSTALL_DIR/server.crt" ] && [ -f "$INSTALL_DIR/server.key" ] && return 0
+    echo "Generating a self-signed TLS certificate for wss/wssmux..."
     openssl req -x509 -newkey rsa:2048 -nodes \
         -keyout "$INSTALL_DIR/server.key" -out "$INSTALL_DIR/server.crt" \
         -days 3650 -subj "/CN=backhaul" >/dev/null 2>&1
 }
 
-gen_port() {
-    echo $(( (RANDOM % 40000) + 20000 ))
+pick_transport() {
+    {
+        echo "Transport:"
+        echo "  1) wss     - TLS, looks like HTTPS to firewalls (recommended)"
+        echo "  2) wssmux  - wss + multiplexing (many concurrent connections)"
+        echo "  3) tcp     - plain TCP, fastest, not encrypted/disguised"
+        echo "  4) tcpmux  - tcp + multiplexing"
+    } >&2
+    local c; read -rp "Choice [1-4] (default 1): " c
+    case "$c" in 2) echo "wssmux" ;; 3) echo "tcp" ;; 4) echo "tcpmux" ;; *) echo "wss" ;; esac
 }
 
-# ============================================================
-# MTU pinning (persisted across reboots via a oneshot systemd unit)
-# ============================================================
+# =============================================================================
+#  Unit registry  (one .env per tunnel service — used by the watchdog)
+# =============================================================================
+list_units() {
+    { systemctl list-unit-files 'backhaul-*.service' --no-legend 2>/dev/null
+      systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null; } \
+      | awk '{print $1}' | grep -E '\.service$' \
+      | grep -vE '^backhaul-(mtu|watchdog)\.service$' | sort -u
+}
+
+register_unit() {  # unit role toml port peer transport
+    mkdir -p "$UNITS_DIR"
+    cat > "$UNITS_DIR/$1.env" << EOF
+ROLE=$2
+TOML=$3
+PORT=$4
+PEER=$5
+TRANSPORT=$6
+EOF
+}
+
+rebuild_registry() {  # re-derive the registry from whatever is installed
+    mkdir -p "$UNITS_DIR"
+    rm -f "$UNITS_DIR"/*.env
+    local u toml role port peer transport addr
+    for u in $(list_units); do
+        toml=$(grep -oE "${INSTALL_DIR}/[A-Za-z0-9_.-]+\.toml" "/etc/systemd/system/$u" 2>/dev/null | head -n1)
+        [ -n "$toml" ] && [ -f "$toml" ] || continue
+        transport=$(grep -oE '^transport *= *"[^"]+"' "$toml" | cut -d'"' -f2)
+        if grep -q '^\[server\]' "$toml"; then
+            role="iran"; peer=""
+            addr=$(grep -oE '^bind_addr *= *"[^"]+"' "$toml" | cut -d'"' -f2)
+        else
+            role="kharej"
+            addr=$(grep -oE '^remote_addr *= *"[^"]+"' "$toml" | cut -d'"' -f2)
+            peer="${addr%:*}"
+        fi
+        port="${addr##*:}"
+        [ -n "$port" ] || continue
+        register_unit "$u" "$role" "$toml" "$port" "$peer" "$transport"
+    done
+}
+
+count_conns() {  # role port peer -> number of established connections
+    local role="$1" port="$2" peer="$3" filter
+    if [ "$role" = "iran" ]; then
+        filter="( sport = :$port )"
+    elif valid_ipv4 "$peer"; then
+        filter="( dst $peer:$port )"
+    else
+        filter="( dport = :$port )"
+    fi
+    ss -H -tn state established "$filter" 2>/dev/null | grep -c .
+}
+
+# =============================================================================
+#  systemd unit writer
+# =============================================================================
+write_service() {  # unit-name description toml
+    cat > "/etc/systemd/system/$1" << EOF
+[Unit]
+Description=$2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${BIN} -c $3
+Restart=always
+RestartSec=1
+StartLimitIntervalSec=0
+LimitNOFILE=1048576
+TasksMax=infinity
+LimitMEMLOCK=infinity
+OOMScoreAdjust=-1000
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# =============================================================================
+#  Install — Iran side (server)
+# =============================================================================
+install_iran() {
+    title "Iran server (server side)"
+    local port inbound transport toml unit
+
+    while true; do
+        port=$(ask "Tunnel port" "$(gen_port)")
+        valid_port "$port" && break || fail "Invalid port."
+    done
+    transport=$(pick_transport)
+    while true; do
+        inbound=$(ask "Inbound ports on this server (comma separated, e.g. 2050,2087)" "")
+        [ -n "$inbound" ] && break || fail "At least one inbound port is required."
+    done
+
+    ensure_backhaul || return 1
+    case "$transport" in wss|wssmux) ensure_tls_cert ;; esac
+
+    toml="$INSTALL_DIR/iran-${port}.toml"
+    unit="backhaul-iran-${port}.service"
+
+    {
+        echo "[server]"
+        echo "bind_addr = \"0.0.0.0:${port}\""
+        echo "transport = \"${transport}\""
+        echo "token = \"${FIXED_TOKEN}\""
+        echo "keepalive_period = 20"
+        echo "nodelay = true"
+        echo "channel_size = 16384"
+        echo "heartbeat = 10"
+        echo "mux_con = 8"
+        case "$transport" in wss|wssmux)
+            echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
+            echo "tls_key = \"${INSTALL_DIR}/server.key\"" ;;
+        esac
+        echo "sniffer = false"
+        echo "web_port = 0"
+        echo "log_level = \"warn\""
+        echo ""
+        echo "ports = ["
+    } > "$toml"
+    local -a arr; IFS=',' read -ra arr <<< "$inbound"
+    local i p
+    for i in "${!arr[@]}"; do
+        p=$(echo "${arr[i]}" | xargs)
+        [ -z "$p" ] && continue
+        if [ $((i + 1)) -eq ${#arr[@]} ]; then echo "    \"${p}\"" >> "$toml"
+        else echo "    \"${p}\"," >> "$toml"; fi
+    done
+    echo "]" >> "$toml"
+
+    write_service "$unit" "Backhaul Iran server (port ${port})" "$toml"
+    register_unit "$unit" "iran" "$toml" "$port" "" "$transport"
+    rm -f "$WD_STATE/$unit.paused"
+    systemctl daemon-reload
+    systemctl enable --now "$unit" >/dev/null 2>&1
+    ok "Iran server started on port ${port} (${transport})."
+    echo
+    echo "  >>> On the Kharej server, enter this server's IP and port ${port}."
+}
+
+# =============================================================================
+#  Install — Kharej side (client)  —  supports MANY Iran servers
+# =============================================================================
+create_client() {  # ip port transport
+    local ip="$1" port="$2" transport="$3" toml unit
+    toml="$INSTALL_DIR/kharej-$(slug "$ip")-${port}.toml"
+    unit="backhaul-kharej-$(slug "$ip")-${port}.service"
+
+    if [ -f "/etc/systemd/system/$unit" ]; then
+        if ! confirm "  A tunnel to ${ip}:${port} already exists. Overwrite?"; then
+            warn "  Skipped ${ip}:${port}."; return 0
+        fi
+    fi
+
+    cat > "$toml" << EOF
+[client]
+remote_addr = "${ip}:${port}"
+transport = "${transport}"
+token = "${FIXED_TOKEN}"
+connection_pool = 8
+aggressive_pool = true
+keepalive_period = 20
+dial_timeout = 5
+retry_interval = 1
+nodelay = true
+sniffer = false
+web_port = 0
+log_level = "warn"
+EOF
+
+    write_service "$unit" "Backhaul Kharej client -> ${ip}:${port}" "$toml"
+    register_unit "$unit" "kharej" "$toml" "$port" "$ip" "$transport"
+    rm -f "$WD_STATE/$unit.paused"
+    systemctl daemon-reload
+    systemctl enable --now "$unit" >/dev/null 2>&1
+    ok "  Tunnel -> ${ip}:${port} started (${transport})."
+}
+
+install_kharej() {
+    title "Kharej server (client side)"
+    echo "One Kharej server can hold several tunnels at the same time —"
+    echo "one independent service per Iran server."
+    echo
+
+    local n transport i ip port
+    while true; do
+        n=$(ask "How many Iran servers do you want to connect to now?" "1")
+        [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && break || fail "Enter a number >= 1."
+    done
+    transport=$(pick_transport)
+    echo "(All Iran servers below must use the same transport: ${transport})"
+
+    ensure_backhaul || return 1
+
+    for ((i = 1; i <= n; i++)); do
+        echo
+        echo -e "${CB}--- Iran server #${i} ---${C0}"
+        while true; do
+            ip=$(ask "  Public IP of Iran server #${i}" "")
+            [ -n "$ip" ] || { fail "  IP cannot be empty."; continue; }
+            valid_ipv4 "$ip" || warn "  Not an IPv4 address — the watchdog will fall back to port-only checks."
+            break
+        done
+        while true; do
+            port=$(ask "  Tunnel port of Iran server #${i} (must match that server)" "")
+            valid_port "$port" && break || fail "  Invalid port."
+        done
+        create_client "$ip" "$port" "$transport"
+    done
+
+    echo
+    ok "${n} tunnel(s) configured on this Kharej server."
+    echo "  Run option 1 again any time to add more Iran servers."
+}
+
+install_flow() {
+    title "Install / add a tunnel"
+    echo "  1) Iran server    (server side — accepts the tunnel)"
+    echo "  2) Kharej server  (client side — connects to Iran servers)"
+    local r; read -rp "Select [1-2]: " r
+    case "$r" in
+        1) install_iran ;;
+        2) install_kharej ;;
+        *) fail "Invalid selection."; return ;;
+    esac
+
+    echo
+    confirm "Run the system optimizer now (BBR, buffers, MTU, DNS, limits)?" && optimize_system
+    confirm "Install/refresh the watchdog?" && setup_watchdog
+}
+
+# =============================================================================
+#  Status
+# =============================================================================
+show_status() {
+    title "Status"
+    local units u conns state uptime
+    units=$(list_units)
+    if [ -z "$units" ]; then warn "No tunnel service on this server."; return; fi
+
+    printf "%-42s %-9s %-7s %s\n" "SERVICE" "STATE" "CONNS" "TARGET"
+    for u in $units; do
+        ( unset ROLE TOML PORT PEER TRANSPORT
+          [ -f "$UNITS_DIR/$u.env" ] && . "$UNITS_DIR/$u.env"
+          if systemctl is-active --quiet "$u"; then state="UP"; else state="DOWN"; fi
+          [ -f "$WD_STATE/$u.paused" ] && state="PAUSED"
+          conns=$(count_conns "${ROLE:-iran}" "${PORT:-0}" "${PEER:-}")
+          if [ "${ROLE:-}" = "kharej" ]; then target="${PEER}:${PORT} (${TRANSPORT})"
+          else target="0.0.0.0:${PORT} (${TRANSPORT})"; fi
+          printf "%-42s %-9s %-7s %s\n" "$u" "$state" "$conns" "$target" )
+    done
+
+    echo
+    echo "Recent errors (last 20 log lines per service):"
+    local found=0 warnmsg
+    for u in $units; do
+        warnmsg=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null \
+            | grep -iE "invalid security token|error|failed" | tail -n 2)
+        if [ -n "$warnmsg" ]; then found=1; echo "  --- $u"; echo "$warnmsg" | sed 's/^/    /'; fi
+    done
+    [ "$found" = "0" ] && echo "  none"
+    [ "$found" = "1" ] && echo "  (invalid security token = the token differs between the two servers)"
+
+    echo
+    if systemctl is-active --quiet backhaul-watchdog.timer; then
+        ok "Watchdog: active (every ${WD_TICK}s)"
+    else
+        warn "Watchdog: not installed/inactive — use menu option 5."
+    fi
+    if [ -f "$WD_LOG" ]; then
+        echo "Last 8 watchdog actions:"
+        tail -n 8 "$WD_LOG" | sed 's/^/  /'
+    fi
+}
+
+# =============================================================================
+#  Inbound port editor (Iran side)
+# =============================================================================
+read_ports()  { sed -n '/^ports = \[/,/^\]/p' "$1" | grep -oE '"[^"]*"' | tr -d '"'; }
+write_ports() {  # file port...
+    local f="$1"; shift
+    local tmp; tmp=$(mktemp)
+    sed '/^ports = \[/,/^\]/d' "$f" > "$tmp"
+    { echo "ports = ["
+      local n=$# i=0 p
+      for p in "$@"; do
+          i=$((i + 1))
+          if [ "$i" -lt "$n" ]; then echo "    \"$p\","; else echo "    \"$p\""; fi
+      done
+      echo "]"
+    } >> "$tmp"
+    mv "$tmp" "$f"
+}
+
+ports_menu() {  # toml unit
+    local toml="$1" unit="$2" c p; local -a arr
+    while true; do
+        echo
+        echo "Inbound ports in $(basename "$toml"):"
+        if [ -z "$(read_ports "$toml")" ]; then echo "  (none)"; else read_ports "$toml" | sed 's/^/  - /'; fi
+        echo "  1) Add    2) Remove    0) Back"
+        read -rp "Select: " c
+        case "$c" in
+            1) p=$(ask "Port to add (e.g. 2050 or 443=1.1.1.1:443)" "")
+               [ -z "$p" ] && continue
+               mapfile -t arr < <(read_ports "$toml"); arr+=("$p")
+               write_ports "$toml" "${arr[@]}"
+               systemctl restart "$unit"; ok "Added and restarted." ;;
+            2) p=$(ask "Port to remove" "")
+               [ -z "$p" ] && continue
+               mapfile -t arr < <(read_ports "$toml" | grep -vx "$p")
+               write_ports "$toml" "${arr[@]}"
+               systemctl restart "$unit"; ok "Removed and restarted." ;;
+            0) return ;;
+            *) fail "Invalid option." ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  Service manager
+# =============================================================================
+manage_services() {
+    local units; units=$(list_units)
+    if [ -z "$units" ]; then warn "No tunnel service on this server."; return; fi
+
+    title "Services"
+    local -a list; mapfile -t list < <(echo "$units")
+    local i
+    for i in "${!list[@]}"; do printf "  %d) %s\n" "$((i + 1))" "${list[i]}"; done
+    echo "  0) Back"
+    local sel; read -rp "Select: " sel
+    [[ "$sel" =~ ^[0-9]+$ ]] || { fail "Invalid."; return; }
+    [ "$sel" = "0" ] && return
+    local unit="${list[$((sel - 1))]}"
+    [ -z "$unit" ] && { fail "Invalid."; return; }
+
+    unset ROLE TOML PORT PEER TRANSPORT
+    [ -f "$UNITS_DIR/$unit.env" ] && . "$UNITS_DIR/$unit.env"
+    [ -z "$TOML" ] && TOML=$(grep -oE "${INSTALL_DIR}/[A-Za-z0-9_.-]+\.toml" "/etc/systemd/system/$unit" | head -n1)
+
+    local c r d
+    while true; do
+        echo
+        hr
+        echo "  $unit"
+        systemctl is-active  --quiet "$unit"   && echo "  State: RUNNING" || echo "  State: STOPPED"
+        systemctl is-enabled --quiet "$unit" 2>/dev/null && echo "  Auto-start: enabled" || echo "  Auto-start: disabled"
+        [ -f "$WD_STATE/$unit.paused" ] && echo "  Watchdog: PAUSED (stopped by hand)"
+        [ -n "$PORT" ] && echo "  Connections: $(count_conns "${ROLE:-iran}" "$PORT" "${PEER:-}")"
+        hr
+        echo "  1) Start        2) Stop         3) Restart"
+        echo "  4) Live logs    5) View config  6) Edit config"
+        [ "${ROLE:-}" = "iran" ] && echo "  7) Inbound ports"
+        echo "  8) Delete this service"
+        echo "  0) Back"
+        read -rp "Select: " c
+        case "$c" in
+            1) rm -f "$WD_STATE/$unit.paused"; systemctl start "$unit"; ok "Started." ;;
+            2) touch "$WD_STATE/$unit.paused"; systemctl stop "$unit"
+               ok "Stopped (the watchdog will leave it alone until you start it again)." ;;
+            3) rm -f "$WD_STATE/$unit.paused"; systemctl restart "$unit"; ok "Restarted." ;;
+            4) journalctl -u "$unit" -f ;;
+            5) [ -n "$TOML" ] && cat "$TOML" || fail "Config not found." ;;
+            6) if [ -n "$TOML" ]; then
+                   ${EDITOR:-nano} "$TOML"
+                   confirm "Restart to apply?" && systemctl restart "$unit" && ok "Restarted."
+                   rebuild_registry
+               else fail "Config not found."; fi ;;
+            7) [ "${ROLE:-}" = "iran" ] && ports_menu "$TOML" "$unit" || fail "Invalid option." ;;
+            8) read -rp "Delete $unit and its config? [y/N]: " d
+               if [[ "$d" =~ ^[Yy]$ ]]; then
+                   systemctl disable --now "$unit" >/dev/null 2>&1
+                   rm -f "/etc/systemd/system/$unit" "$UNITS_DIR/$unit.env"
+                   rm -f "$WD_STATE/$unit".*
+                   [ -n "$TOML" ] && rm -f "$TOML"
+                   systemctl daemon-reload
+                   ok "Deleted."; return
+               fi ;;
+            0) return ;;
+            *) fail "Invalid option." ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  System optimizer (BBR + sysctl + MTU + DNS + ulimits)
+# =============================================================================
+ensure_ulimits() {
+    echo "-- file descriptor limits"
+    sysctl -w fs.file-max=2097152 >/dev/null 2>&1
+    if ! grep -q "backhaul-tunnel limits" /etc/security/limits.conf 2>/dev/null; then
+        cat >> /etc/security/limits.conf << 'EOF'
+
+# backhaul-tunnel limits
+root soft nofile 1048576
+root hard nofile 1048576
+* soft nofile 1048576
+* hard nofile 1048576
+EOF
+    fi
+    ulimit -n 1048576 2>/dev/null
+    ok "File descriptor limits raised."
+}
 
 ensure_mtu() {
-    echo ""
-    echo "=== Setting MTU to 1400 ==="
-    local iface
-    iface=$(detect_default_iface)
-    echo "Interface: $iface"
-
-    ip link set dev "$iface" mtu 1400 2>/dev/null || echo "Could not set MTU live (will still persist for next boot)."
-
+    echo "-- MTU 1400"
+    local iface; iface=$(detect_default_iface)
+    ip link set dev "$iface" mtu 1400 2>/dev/null || warn "Could not set MTU live (will apply at next boot)."
     cat > /etc/systemd/system/backhaul-mtu.service << EOF
 [Unit]
-Description=Pin MTU 1400 on ${iface} for Backhaul tunnel
+Description=Pin MTU 1400 on ${iface} for the Backhaul tunnel
 After=network-online.target
 Wants=network-online.target
 
@@ -144,106 +573,28 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now backhaul-mtu.service >/dev/null 2>&1
-    echo "MTU 1400 applied and will persist after reboot (backhaul-mtu.service)."
+    ok "MTU 1400 pinned on ${iface} (persists after reboot)."
 }
 
-# ============================================================
-# DNS pinning
-# ============================================================
-
 ensure_dns() {
-    echo ""
-    echo "=== Setting DNS to 1.1.1.1 / 1.0.0.1 / 8.8.8.8 ==="
-    if [ -L /etc/resolv.conf ]; then
-        # Usually managed by systemd-resolved — replace the symlink with a static file
-        # so it isn't reset. This detaches this host from systemd-resolved's stub DNS.
-        rm -f /etc/resolv.conf
-    fi
-    cat > /etc/resolv.conf << EOF
+    echo "-- DNS 1.1.1.1 / 1.0.0.1 / 8.8.8.8"
+    chattr -i /etc/resolv.conf 2>/dev/null
+    [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf << 'EOF'
 nameserver 1.1.1.1
 nameserver 1.0.0.1
 nameserver 8.8.8.8
 EOF
-    # Best-effort: prevent NetworkManager/dhcp client from overwriting it back.
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    echo "DNS set. (If this server uses systemd-resolved/NetworkManager, this file is now static/locked with chattr +i.)"
+    chattr +i /etc/resolv.conf 2>/dev/null
+    ok "DNS pinned (/etc/resolv.conf is now static and locked with chattr +i)."
 }
-
-# ============================================================
-# File descriptor / ulimit tuning
-# ============================================================
-
-ensure_ulimits() {
-    echo ""
-    echo "=== Raising file descriptor limits ==="
-    if ! grep -q "^fs.file-max" /etc/sysctl.d/99-backhaul-tunnel.conf 2>/dev/null; then
-        echo "fs.file-max=2097152" >> /etc/sysctl.d/99-backhaul-tunnel.conf
-    fi
-    sysctl -w fs.file-max=2097152 > /dev/null 2>&1
-
-    if ! grep -q "backhaul-tunnel limits" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf << EOF
-
-# backhaul-tunnel limits
-root soft nofile 1048576
-root hard nofile 1048576
-* soft nofile 1048576
-* hard nofile 1048576
-EOF
-    fi
-    ulimit -n 1048576 2>/dev/null || true
-    echo "File descriptor limits raised (takes full effect for new sessions/services)."
-}
-
-# ============================================================
-# System Optimizer (BBR + network sysctl tuning + MTU + DNS + ulimits)
-# ============================================================
 
 optimize_system() {
-    echo ""
-    echo "=== System Optimization ==="
-    local INTERFACE
-    INTERFACE=$(detect_default_iface)
-    echo "Interface: $INTERFACE"
+    title "System optimizer"
+    echo "Interface: $(detect_default_iface)"
 
-    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1 && echo "BBR congestion control enabled." \
-        || echo "BBR module not available on this kernel — staying on the default (usually CUBIC)."
-
-    sysctl -w net.core.somaxconn=65535 > /dev/null 2>&1
-    sysctl -w net.core.netdev_max_backlog=250000 > /dev/null 2>&1
-    sysctl -w net.ipv4.ip_local_port_range="1024 65535" > /dev/null 2>&1
-
-    sysctl -w net.core.rmem_max=134217728 > /dev/null 2>&1
-    sysctl -w net.core.wmem_max=134217728 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" > /dev/null 2>&1
-
-    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_user_timeout=30000 > /dev/null 2>&1
-
-    sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
-
-    # Kept from the original profile — not superseded by the new list.
-    sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_retries2=6 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_syn_retries=2 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_no_metrics_save=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
-
-    # Deliberately NOT set (can backfire on newer kernels / behind NAT-CGNAT):
-    #   net.ipv4.tcp_tw_recycle   (removed in modern kernels)
-    #   net.ipv4.tcp_tw_reuse=1   (can break behind NAT/CGNAT)
-
-    cat > /etc/sysctl.d/99-backhaul-tunnel.conf << EOF
+    cat > /etc/sysctl.d/99-backhaul-tunnel.conf << 'EOF'
+# --- Backhaul tunnel profile -------------------------------------------------
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.somaxconn=65535
@@ -253,116 +604,193 @@ net.core.rmem_max=134217728
 net.core.wmem_max=134217728
 net.ipv4.tcp_rmem=4096 87380 134217728
 net.ipv4.tcp_wmem=4096 65536 134217728
-net.ipv4.tcp_keepalive_time=60
-net.ipv4.tcp_keepalive_intvl=10
-net.ipv4.tcp_keepalive_probes=6
-net.ipv4.tcp_user_timeout=30000
+# fast dead-peer / packet-loss detection
+net.ipv4.tcp_keepalive_time=30
+net.ipv4.tcp_keepalive_intvl=5
+net.ipv4.tcp_keepalive_probes=4
+net.ipv4.tcp_user_timeout=20000
+net.ipv4.tcp_retries2=6
+net.ipv4.tcp_syn_retries=2
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_window_scaling=1
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_sack=1
-net.ipv4.tcp_retries2=6
-net.ipv4.tcp_syn_retries=2
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_low_latency=1
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_no_metrics_save=1
 net.ipv4.ip_forward=1
+fs.file-max=2097152
+# Deliberately NOT set: tcp_tw_recycle (removed from modern kernels),
+# tcp_tw_reuse (can break behind NAT/CGNAT).
 EOF
-    echo "Saved to /etc/sysctl.d/99-backhaul-tunnel.conf (persists across reboots)."
+    sysctl --system >/dev/null 2>&1
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        ok "BBR + fq enabled."
+    else
+        warn "BBR not available on this kernel — staying on the default (usually CUBIC)."
+    fi
+    ok "Saved to /etc/sysctl.d/99-backhaul-tunnel.conf (persists across reboots)."
 
     ensure_ulimits
     ensure_mtu
     ensure_dns
-
-    echo ""
-    echo "Optimization complete."
+    echo
+    ok "Optimization complete."
 }
 
-# ============================================================
-# Watchdog (health check + auto-restart)
-# ============================================================
-
+# =============================================================================
+#  Watchdog
+# =============================================================================
 setup_watchdog() {
-    echo ""
-    echo "=== Installing Watchdog ==="
-    mkdir -p "$WATCHDOG_STATE_DIR"
+    title "Watchdog"
+    command -v ss >/dev/null 2>&1 || warn "'ss' not found — install iproute2, the watchdog needs it."
 
-    cat > "$WATCHDOG_SCRIPT" << 'WDEOF'
+    mkdir -p "$WD_DIR" "$WD_STATE"
+    rebuild_registry
+
+    cat > "$WD_CONF" << EOF
+# Backhaul watchdog tuning — edit, then: systemctl restart backhaul-watchdog.timer
+IDLE_THRESHOLD=${WD_IDLE}      # seconds with 0 established connections -> restart
+STALL_THRESHOLD=${WD_STALL}    # seconds with every socket unacked (packet loss) -> restart
+RESTART_COOLDOWN=${WD_COOLDOWN} # min seconds between two restarts of one service
+START_GRACE=${WD_GRACE}        # ignore a service for N seconds after it (re)starts
+LOG_MAX_LINES=800
+EOF
+
+    cat > "$WD_SCRIPT" << 'WDEOF'
 #!/bin/bash
-# Backhaul watchdog — runs every 10s via backhaul-watchdog.timer
-# Restarts a service if:
-#   1) it is not active, OR
-#   2) it has been active but with zero established connections on its
-#      tunnel port for WATCHDOG_IDLE_THRESHOLD seconds (link looks dead/hung).
+# Backhaul watchdog — started every few seconds by backhaul-watchdog.timer
+#
+# A service is restarted when:
+#   1) it is not active at all                       -> restart (short cooldown)
+#   2) it has 0 established connections on its own
+#      tunnel endpoint for IDLE_THRESHOLD seconds    -> link is dead
+#   3) every established socket of that endpoint has
+#      unacknowledged data for STALL_THRESHOLD secs  -> packet loss / black hole
+#      (the socket still says ESTABLISHED, but nothing gets through)
+#
+# It never touches a service that: was stopped from the menu (.paused),
+# is disabled, or (re)started less than START_GRACE seconds ago.
 
 INSTALL_DIR="/root/backhaul-core"
-STATE_DIR="$INSTALL_DIR/watchdog-state"
-LOG_FILE="$INSTALL_DIR/watchdog.log"
-IDLE_THRESHOLD=30
+UNITS_DIR="$INSTALL_DIR/units"
+WD_DIR="$INSTALL_DIR/watchdog"
+STATE="$WD_DIR/state"
+LOG="$WD_DIR/watchdog.log"
+CONF="$WD_DIR/watchdog.conf"
 
-mkdir -p "$STATE_DIR"
+IDLE_THRESHOLD=20
+STALL_THRESHOLD=15
+RESTART_COOLDOWN=60
+START_GRACE=45
+LOG_MAX_LINES=800
+[ -f "$CONF" ] && . "$CONF"
 
-for unit in $(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}'); do
-    case "$unit" in
-        backhaul-mtu.service|backhaul-watchdog.service) continue ;;
-    esac
+mkdir -p "$STATE"
+NOW=$(date +%s)
 
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+unit_uptime() {  # seconds since the unit became active (999999 if unknown)
+    local t up
+    t=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$1" 2>/dev/null)
+    if [ -z "$t" ] || [ "$t" = "0" ]; then echo 999999; return; fi
+    up=$(awk '{printf "%d", $1*1000000}' /proc/uptime)
+    echo $(( (up - t) / 1000000 ))
+}
+
+do_restart() {  # unit reason cooldown
+    local unit="$1" reason="$2" cd="$3" f="$STATE/$unit.restart" last
+    last=$(cat "$f" 2>/dev/null || echo 0)
+    [ $(( NOW - last )) -lt "$cd" ] && return 0
+    echo "$NOW" > "$f"
+    systemctl restart "$unit" >/dev/null 2>&1
+    rm -f "$STATE/$unit.ok" "$STATE/$unit.stall"
+    log "restarted $unit — $reason"
+}
+
+for envf in "$UNITS_DIR"/*.env; do
+    [ -f "$envf" ] || continue
+    unset ROLE TOML PORT PEER TRANSPORT
+    . "$envf"
+    unit=$(basename "$envf" .env)
+
+    [ -f "/etc/systemd/system/$unit" ] || { rm -f "$envf"; continue; }
+    [ -f "$STATE/$unit.paused" ] && continue
+    systemctl is-enabled --quiet "$unit" 2>/dev/null || continue
+
+    # 1) service down
     if ! systemctl is-active --quiet "$unit"; then
-        systemctl restart "$unit" 2>/dev/null
-        echo "$(date '+%F %T') restarted $unit (service was inactive)" >> "$LOG_FILE"
-        rm -f "${STATE_DIR}/${unit}.last_ok"
+        do_restart "$unit" "service was not active" 10
         continue
     fi
 
-    unit_file="/etc/systemd/system/${unit}"
-    toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "$unit_file" 2>/dev/null | head -n1)
-    [ -z "$toml" ] || [ ! -f "$toml" ] && continue
+    # give it time to build its connection pool after a (re)start
+    [ "$(unit_uptime "$unit")" -lt "$START_GRACE" ] && continue
+    [ -n "$PORT" ] || continue
 
-    port=""
-    if grep -q '^\[server\]' "$toml" 2>/dev/null; then
-        port=$(grep -oE 'bind_addr = "0\.0\.0\.0:[0-9]+"' "$toml" | grep -oE '[0-9]+$')
+    if [ "$ROLE" = "iran" ]; then
+        filter="( sport = :$PORT )"; label="port $PORT"
+    elif [[ "$PEER" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        filter="( dst $PEER:$PORT )"; label="$PEER:$PORT"
     else
-        port=$(grep -oE 'remote_addr = "[^:"]+:[0-9]+"' "$toml" | grep -oE '[0-9]+$')
+        filter="( dport = :$PORT )"; label="port $PORT"
     fi
-    [ -z "$port" ] && continue
 
-    active_conns=$(ss -H -tn state established "( sport = :${port} or dport = :${port} )" 2>/dev/null | grep -c .)
-    now=$(date +%s)
-    state_file="${STATE_DIR}/${unit}.last_ok"
+    raw=$(ss -H -tin state established "$filter" 2>/dev/null)
+    conns=$(printf '%s\n' "$raw" | grep -c '^[^[:space:]]')
+    stuck=$(printf '%s\n' "$raw" | grep -c 'unacked:')
 
-    if [ "${active_conns:-0}" -gt 0 ]; then
-        echo "$now" > "$state_file"
-    else
-        last_ok=$(cat "$state_file" 2>/dev/null || echo "$now")
-        idle=$(( now - last_ok ))
+    if [ "$conns" -eq 0 ]; then
+        # 2) nothing established on this endpoint
+        rm -f "$STATE/$unit.stall"
+        last_ok=$(cat "$STATE/$unit.ok" 2>/dev/null)
+        if [ -z "$last_ok" ]; then echo "$NOW" > "$STATE/$unit.ok"; last_ok=$NOW; fi
+        idle=$(( NOW - last_ok ))
         if [ "$idle" -ge "$IDLE_THRESHOLD" ]; then
-            systemctl restart "$unit" 2>/dev/null
-            echo "$now" > "$state_file"
-            echo "$(date '+%F %T') restarted $unit (idle ${idle}s, no established connections on port ${port})" >> "$LOG_FILE"
+            do_restart "$unit" "no established connection on $label for ${idle}s" "$RESTART_COOLDOWN"
+        fi
+    else
+        echo "$NOW" > "$STATE/$unit.ok"
+        # 3) every socket has unacked data -> traffic is not getting through
+        if [ "$stuck" -ge "$conns" ]; then
+            first=$(cat "$STATE/$unit.stall" 2>/dev/null)
+            if [ -z "$first" ]; then echo "$NOW" > "$STATE/$unit.stall"; first=$NOW; fi
+            stalled=$(( NOW - first ))
+            if [ "$stalled" -ge "$STALL_THRESHOLD" ]; then
+                do_restart "$unit" "all $conns socket(s) on $label stalled (unacked) for ${stalled}s" "$RESTART_COOLDOWN"
+            fi
+        else
+            rm -f "$STATE/$unit.stall"
         fi
     fi
 done
+
+# keep the log small
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt "$LOG_MAX_LINES" ]; then
+    tail -n "$LOG_MAX_LINES" "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
 WDEOF
-    chmod +x "$WATCHDOG_SCRIPT"
+    chmod +x "$WD_SCRIPT"
 
     cat > /etc/systemd/system/backhaul-watchdog.service << EOF
 [Unit]
-Description=Backhaul Watchdog (health check / auto-restart)
+Description=Backhaul watchdog (health check / auto-restart)
 
 [Service]
 Type=oneshot
-ExecStart=${WATCHDOG_SCRIPT}
+ExecStart=${WD_SCRIPT}
 EOF
 
-    cat > /etc/systemd/system/backhaul-watchdog.timer << 'EOF'
+    cat > /etc/systemd/system/backhaul-watchdog.timer << EOF
 [Unit]
-Description=Run Backhaul Watchdog every 10 seconds
+Description=Run the Backhaul watchdog every ${WD_TICK} seconds
 
 [Timer]
 OnBootSec=20
-OnUnitActiveSec=10
+OnUnitActiveSec=${WD_TICK}
 AccuracySec=1
 Unit=backhaul-watchdog.service
 
@@ -372,443 +800,65 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
-    echo "Watchdog installed — checks every 10s, restarts a tunnel after ${WATCHDOG_IDLE_THRESHOLD}s with no active connections."
-    echo "Log: $WATCHDOG_LOG"
+    ok "Watchdog installed — tick ${WD_TICK}s, dead link ${WD_IDLE}s, stalled link ${WD_STALL}s."
+    echo "  Tuning: $WD_CONF"
+    echo "  Log:    $WD_LOG"
 }
 
-# ============================================================
-# Status
-# ============================================================
-
-show_status() {
-    echo ""
-    echo "=== Backhaul services ==="
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
-    if [ -z "$units" ]; then
-        echo "No Backhaul services found."
-    else
-        for u in $units; do
-            echo "--- $u ---"
-            systemctl status "$u" --no-pager -l | head -n 6
-            echo ""
-        done
-    fi
-
-    echo "=== Recent warnings (token mismatch / connection issues) ==="
-    local found_warning=0
-    for u in $units; do
-        case "$u" in
-            backhaul-mtu.service|backhaul-watchdog.service) continue ;;
-        esac
-        local warn
-        warn=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed" | tail -n 3)
-        if [ -n "$warn" ]; then
-            found_warning=1
-            echo "--- $u ---"
-            echo "$warn"
-        fi
-    done
-    if [ "$found_warning" = "0" ]; then
-        echo "None found in the last 20 log lines of each service."
-    else
-        echo ""
-        echo "If you see 'invalid security token', the token in the .toml files on the"
-        echo "two servers does not match — check with: grep token ${INSTALL_DIR}/*.toml"
-    fi
-
-    if [ -f "$WATCHDOG_LOG" ]; then
-        echo ""
-        echo "=== Last 10 watchdog restarts ==="
-        tail -n 10 "$WATCHDOG_LOG"
-    fi
-}
-
-# ============================================================
-# Manage inbound ports (Iran server side only)
-# ============================================================
-
-manage_ports() {
-    local tomls
-    tomls=$(ls "$INSTALL_DIR"/iran*.toml 2>/dev/null || true)
-    if [ -z "$tomls" ]; then
-        echo "No Iran server config found on this machine. Run this on the Iran server."
-        return
-    fi
-
-    echo "Found config(s):"
-    select TOML_FILE in $tomls; do
-        [ -n "$TOML_FILE" ] && break
-        echo "Invalid selection."
-    done
-
-    echo ""
-    echo "Current ports:"
-    sed -n '/ports = \[/,/\]/p' "$TOML_FILE"
-
-    echo ""
-    echo "1) Add a port"
-    echo "2) Remove a port"
-    read -p "Choice [1-2]: " PCHOICE
-
-    PORT_NUM=$(basename "$TOML_FILE" | grep -oE '[0-9]+' | head -n1)
-    SERVICE_NAME="backhaul-iran${PORT_NUM}.service"
-
-    if [ "$PCHOICE" = "1" ]; then
-        read -p "Port to add: " NEWPORT
-        sed -i "s/\]/    \"${NEWPORT}\"\n]/" "$TOML_FILE"
-        # normalize: ensure previous last line got a trailing comma
-        python3 - "$TOML_FILE" << 'PYEOF' 2>/dev/null || true
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-lines = content.split("\n")
-out = []
-in_ports = False
-port_lines_idx = []
-for i, l in enumerate(lines):
-    if 'ports = [' in l:
-        in_ports = True
-    if in_ports and l.strip().startswith('"'):
-        port_lines_idx.append(i)
-    if in_ports and l.strip() == ']':
-        in_ports = False
-for idx_pos, i in enumerate(port_lines_idx):
-    l = lines[i].rstrip(',').rstrip()
-    if idx_pos != len(port_lines_idx) - 1:
-        lines[i] = l + ","
-    else:
-        lines[i] = l
-with open(path, "w") as f:
-    f.write("\n".join(lines))
-PYEOF
-        echo "Added port ${NEWPORT}."
-    else
-        read -p "Port to remove: " OLDPORT
-        sed -i "/\"${OLDPORT}\"/d" "$TOML_FILE"
-        echo "Removed port ${OLDPORT}."
-    fi
-
-    systemctl restart "$SERVICE_NAME"
-    echo "Restarted $SERVICE_NAME."
-}
-
-# ============================================================
-# Service management (start/stop/restart/logs/enable/disable/edit)
-# ============================================================
-
-manage_services() {
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}' | grep -vE '^backhaul-(mtu|watchdog)\.service$')
-    if [ -z "$units" ]; then
-        echo "No Backhaul tunnel services found on this server."
-        return
-    fi
-
-    echo ""
-    echo "Select a service to manage:"
-    select SERVICE_NAME in $units; do
-        [ -n "$SERVICE_NAME" ] && break
-        echo "Invalid selection."
-    done
-
-    local TOML_FILE
-    TOML_FILE=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "/etc/systemd/system/${SERVICE_NAME}" | head -n1)
-
-    while true; do
-        echo ""
-        echo "=== $SERVICE_NAME ==="
-        systemctl is-active --quiet "$SERVICE_NAME" && echo "Status: RUNNING" || echo "Status: STOPPED"
-        systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && echo "Auto-start: enabled" || echo "Auto-start: disabled"
-        echo ""
-        echo "1) Start"
-        echo "2) Stop"
-        echo "3) Restart"
-        echo "4) Full status"
-        echo "5) Live logs (Ctrl+C to exit)"
-        echo "6) Enable auto-start"
-        echo "7) Disable auto-start"
-        echo "8) View config"
-        echo "9) Edit config"
-        echo "10) Delete this service"
-        echo "0) Back"
-        read -p "Select: " SCHOICE
-        case "$SCHOICE" in
-            1) systemctl start "$SERVICE_NAME"; echo "Started." ;;
-            2) systemctl stop "$SERVICE_NAME"; echo "Stopped." ;;
-            3) systemctl restart "$SERVICE_NAME"; echo "Restarted." ;;
-            4) systemctl status "$SERVICE_NAME" --no-pager -l ;;
-            5) journalctl -u "$SERVICE_NAME" -f ;;
-            6) systemctl enable "$SERVICE_NAME"; echo "Enabled." ;;
-            7) systemctl disable "$SERVICE_NAME"; echo "Disabled." ;;
-            8) [ -n "$TOML_FILE" ] && cat "$TOML_FILE" || echo "Config path not found." ;;
-            9) if [ -n "$TOML_FILE" ]; then
-                   ${EDITOR:-nano} "$TOML_FILE"
-                   read -p "Restart service to apply changes? (y/n): " R
-                   [ "$R" = "y" ] && systemctl restart "$SERVICE_NAME" && echo "Restarted."
-               else
-                   echo "Config path not found."
-               fi ;;
-            10) read -p "Delete $SERVICE_NAME and its config? (y/n): " D
-                if [ "$D" = "y" ]; then
-                    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-                    rm -f "/etc/systemd/system/${SERVICE_NAME}"
-                    [ -n "$TOML_FILE" ] && rm -f "$TOML_FILE"
-                    systemctl daemon-reload
-                    echo "Deleted."
-                    return
-                fi ;;
-            0) return ;;
-            *) echo "Invalid option." ;;
-        esac
-    done
-}
-
-# ============================================================
-# Uninstall
-# ============================================================
-
+# =============================================================================
+#  Uninstall
+# =============================================================================
 uninstall_all() {
-    read -p "This will remove ALL Backhaul services (including watchdog/MTU units) on THIS server. Continue? (y/n): " CONFIRM
-    if [ "$CONFIRM" != "y" ]; then
-        echo "Cancelled."
-        return
-    fi
+    title "Uninstall"
+    if ! confirm "Remove ALL Backhaul services on THIS server?"; then echo "Cancelled."; return; fi
 
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
-    for u in $units; do
-        systemctl disable --now "$u" >/dev/null 2>&1 || true
+    local u
+    for u in $(list_units); do
+        systemctl disable --now "$u" >/dev/null 2>&1
         rm -f "/etc/systemd/system/$u"
     done
-    systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1 || true
+    systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
     rm -f /etc/systemd/system/backhaul-watchdog.timer /etc/systemd/system/backhaul-watchdog.service
-
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
-    echo "Uninstalled. (Note: MTU/DNS/sysctl system tuning was left in place — re-run and choose"
-    echo "the optimizer options manually to revert those if needed.)"
+    ok "Services and configs removed."
+
+    if confirm "Also revert the system tuning (sysctl / MTU / DNS lock)?"; then
+        systemctl disable --now backhaul-mtu.service >/dev/null 2>&1
+        rm -f /etc/systemd/system/backhaul-mtu.service /etc/sysctl.d/99-backhaul-tunnel.conf
+        chattr -i /etc/resolv.conf 2>/dev/null
+        systemctl daemon-reload
+        sysctl --system >/dev/null 2>&1
+        ok "System tuning reverted (a reboot fully restores MTU/DNS)."
+    else
+        warn "System tuning left in place."
+    fi
 }
 
-# ============================================================
-# Install
-# ============================================================
-
-install_flow() {
-    mkdir -p "$INSTALL_DIR"
-    echo ""
-    echo "Are you setting up the Iran server or the Kharej server?"
-    select LOCAL_ROLE in "Iran" "Kharej"; do
-        case $LOCAL_ROLE in
-            Iran|Kharej) break;;
-            *) echo "Invalid selection.";;
-        esac
-    done
-
-    LOCAL_PUBLIC_IP_GUESS=$(detect_public_ip)
-    read -p "This server's public IP [${LOCAL_PUBLIC_IP_GUESS}]: " LOCAL_PUBLIC_IP
-    LOCAL_PUBLIC_IP=${LOCAL_PUBLIC_IP:-$LOCAL_PUBLIC_IP_GUESS}
-
-    read -p "The OTHER server's public IP: " PEER_PUBLIC_IP
-
-    echo ""
-    echo "Choose transport:"
-    echo "  1) wss     - TLS encrypted, looks like HTTPS to firewalls (recommended)"
-    echo "  2) wssmux  - wss + multiplexing, best for many concurrent connections / high throughput"
-    echo "  3) tcp     - plain TCP, fastest but not encrypted or disguised"
-    echo "  4) tcpmux  - tcp + multiplexing"
-    read -p "Enter choice [1-4] (default 1): " TRANSPORT_CHOICE
-    case "$TRANSPORT_CHOICE" in
-        2) TRANSPORT="wssmux" ;;
-        3) TRANSPORT="tcp" ;;
-        4) TRANSPORT="tcpmux" ;;
-        *) TRANSPORT="wss" ;;
-    esac
-
-    # Token is fixed (as requested) — same on both servers, no prompt needed.
-    # NOTE: this is much weaker than a random token. Anyone who guesses/knows
-    # "123" can authenticate to your tunnel. Fine for quick testing, but
-    # consider a random token (openssl rand -hex 24) for anything real.
-    TOKEN="$FIXED_TOKEN"
-
-    # Tunnel port still has to match on both sides. Iran picks/generates it;
-    # Kharej must type in EXACTLY the same port Iran is using.
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        TUNNEL_PORT_DEFAULT=$(gen_port)
-        read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
-        TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
-        read -p "Inbound ports on the Iran server (comma separated, e.g. 2050,2023): " INBOUND_PORTS
-        IRAN_IP="$LOCAL_PUBLIC_IP"; KHAREJ_IP="$PEER_PUBLIC_IP"
-        echo ""
-        echo ">>> Tunnel port: $TUNNEL_PORT   (token is fixed: $TOKEN)"
-        echo ">>> Enter this EXACT port when you run this script on the Kharej server."
-    else
-        echo ""
-        echo "This MUST exactly match the port shown on the Iran server."
-        read -p "Enter the tunnel port used on the Iran server: " TUNNEL_PORT
-        KHAREJ_IP="$LOCAL_PUBLIC_IP"; IRAN_IP="$PEER_PUBLIC_IP"
-    fi
-
-    ensure_backhaul_local
-    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-        if [ "$LOCAL_ROLE" = "Iran" ]; then
-            ensure_tls_cert_local
-        fi
-    fi
-
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        TOML_FILE="$INSTALL_DIR/iran${TUNNEL_PORT}.toml"
-        {
-            echo "[server]"
-            echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
-            echo "transport = \"${TRANSPORT}\""
-            echo "token = \"${TOKEN}\""
-            echo "keepalive_period = 20"
-            echo "nodelay = true"
-            echo "channel_size = 16384"
-            echo "heartbeat = 15"
-            echo "mux_con = 8"
-            if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-                echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
-                echo "tls_key = \"${INSTALL_DIR}/server.key\""
-            fi
-            echo "sniffer = false"
-            echo "web_port = 0"
-            echo "log_level = \"warn\""
-            echo ""
-            echo "ports = ["
-        } > "$TOML_FILE"
-        IFS=',' read -ra PORT_ARRAY <<< "$INBOUND_PORTS"
-        for i in "${!PORT_ARRAY[@]}"; do
-            port=$(echo "${PORT_ARRAY[i]}" | xargs)
-            if [ $((i+1)) -eq ${#PORT_ARRAY[@]} ]; then
-                echo "    \"${port}\"" >> "$TOML_FILE"
-            else
-                echo "    \"${port}\"," >> "$TOML_FILE"
-            fi
-        done
-        echo "]" >> "$TOML_FILE"
-
-        SERVICE_FILE="/etc/systemd/system/backhaul-iran${TUNNEL_PORT}.service"
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Backhaul Iran Server Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${TOML_FILE}
-Restart=always
-RestartSec=1
-StartLimitIntervalSec=0
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-OOMScoreAdjust=-1000
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-iran${TUNNEL_PORT}.service"
-        echo "Local Backhaul (Iran server side) started on port ${TUNNEL_PORT}."
-    else
-        TOML_FILE="$INSTALL_DIR/kharej${TUNNEL_PORT}.toml"
-        cat > "$TOML_FILE" << EOF
-[client]
-remote_addr = "${IRAN_IP}:${TUNNEL_PORT}"
-transport = "${TRANSPORT}"
-token = "${TOKEN}"
-connection_pool = 8
-aggressive_pool = true
-keepalive_period = 20
-nodelay = true
-retry_interval = 1
-sniffer = false
-web_port = 0
-log_level = "warn"
-EOF
-        SERVICE_FILE="/etc/systemd/system/backhaul-kharej${TUNNEL_PORT}.service"
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Backhaul Kharej Client Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${TOML_FILE}
-Restart=always
-RestartSec=1
-StartLimitIntervalSec=0
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-OOMScoreAdjust=-1000
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-kharej${TUNNEL_PORT}.service"
-        echo "Local Backhaul (Kharej client side) started, connecting to ${IRAN_IP}:${TUNNEL_PORT}."
-    fi
-
-    cat > "$STATE_FILE" << EOF
-LOCAL_ROLE=${LOCAL_ROLE}
-TUNNEL_PORT=${TUNNEL_PORT}
-IRAN_IP=${IRAN_IP}
-KHAREJ_IP=${KHAREJ_IP}
-TRANSPORT=${TRANSPORT}
-EOF
-
-    echo ""
-    echo "=== Setup Completed! ==="
-    echo "Tunnel port: $TUNNEL_PORT"
-    echo "Token: $TOKEN"
-    echo "Check: systemctl status 'backhaul-*'"
-    if [ "$TOKEN" = "123" ]; then
-        echo "(Reminder: token is the fixed value '123' — fine for testing, weak for production.)"
-    fi
-
-    read -p "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)? (y/n): " RUNOPT
-    [ "$RUNOPT" = "y" ] && optimize_system
-
-    read -p "Install the watchdog (auto-restart on dead/idle tunnel)? (y/n): " RUNWD
-    [ "$RUNWD" = "y" ] && setup_watchdog
-}
-
-# ============================================================
-# Menu
-# ============================================================
-
+# =============================================================================
+#  Main menu
+# =============================================================================
 while true; do
-    echo ""
-    echo "==== Backhaul Tunnel Manager (v7) ===="
-    echo "1) Install / Setup tunnel"
-    echo "2) Show tunnel status"
-    echo "3) Manage inbound ports (Iran side)"
-    echo "4) Manage services (start/stop/restart/logs/edit)"
-    echo "5) System optimizer (BBR + buffers + MTU + DNS + ulimits)"
-    echo "6) Install/repair Watchdog (auto-restart on dead/idle tunnel)"
-    echo "7) Uninstall tunnel"
-    echo "8) Exit"
-    read -p "Select an option [1-8]: " CHOICE
+    echo
+    hr
+    echo -e "  ${CB}Backhaul Tunnel Manager — v8${C0}    services: $(list_units | grep -c .)"
+    hr
+    echo "  1) Install / add a tunnel"
+    echo "  2) Status"
+    echo "  3) Manage services  (start/stop/logs/config/ports/delete)"
+    echo "  4) System optimizer (BBR, buffers, MTU, DNS, limits)"
+    echo "  5) Install / repair watchdog"
+    echo "  6) Uninstall"
+    echo "  0) Exit"
+    read -rp "Select [0-6]: " CHOICE
     case "$CHOICE" in
         1) install_flow ;;
         2) show_status ;;
-        3) manage_ports ;;
-        4) manage_services ;;
-        5) optimize_system ;;
-        6) setup_watchdog ;;
-        7) uninstall_all ;;
-        8) exit 0 ;;
-        *) echo "Invalid option." ;;
+        3) manage_services ;;
+        4) optimize_system ;;
+        5) setup_watchdog ;;
+        6) uninstall_all ;;
+        0) exit 0 ;;
+        *) fail "Invalid option." ;;
     esac
 done
