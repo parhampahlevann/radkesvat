@@ -1,6 +1,12 @@
 #!/bin/bash
 # =============================================================================
-#  Backhaul Tunnel Manager  (Iran <-> Kharej)  —  v8
+#  Backhaul Tunnel Manager  (Iran <-> Kharej)  —  v8.1
+#
+#  v8.1 fixes
+#   * The install directory is now re-created before every download/write, so
+#     "Failed to open /root/backhaul-core/backhaul.tar.gz" can no longer happen
+#     (it showed up after Uninstall wiped the directory inside the same session).
+#   * DNS is NEVER touched any more: no /etc/resolv.conf rewrite, no chattr.
 #  Official Musixal/Backhaul release binary. Encrypted reverse port forwarding.
 #
 #  WHAT CHANGED vs v7
@@ -71,7 +77,16 @@ if [ "$EUID" -ne 0 ]; then
     fail "Please run as root (sudo)."
     exit 1
 fi
-mkdir -p "$INSTALL_DIR" "$UNITS_DIR" "$WD_DIR" "$WD_STATE"
+ensure_dirs() {   # called again before every write — the dir may have been wiped
+    mkdir -p "$INSTALL_DIR" "$UNITS_DIR" "$WD_DIR" "$WD_STATE" 2>/dev/null
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -w "$INSTALL_DIR" ]; then
+        fail "Cannot create or write to $INSTALL_DIR"
+        df -h /root 2>/dev/null | tail -n1
+        return 1
+    fi
+    return 0
+}
+ensure_dirs
 
 # =============================================================================
 #  Detection / installation helpers
@@ -91,6 +106,7 @@ detect_default_iface() {
 }
 
 ensure_backhaul() {
+    ensure_dirs || return 1
     [ -x "$BIN" ] && return 0
     echo "Fetching the latest official Backhaul release..."
     local arch asset url tries=0
@@ -109,8 +125,13 @@ ensure_backhaul() {
     rm -f "$INSTALL_DIR/backhaul.tar.gz"
     until curl -fSL --retry 3 --retry-delay 2 -o "$INSTALL_DIR/backhaul.tar.gz" "$url"; do
         tries=$((tries + 1))
-        [ "$tries" -ge 3 ] && { fail "Download failed (check disk space / network)."; return 1; }
-        echo "Retrying..."; sleep 2
+        if [ "$tries" -ge 3 ]; then
+            fail "Download failed."
+            echo "  Free space on /root:"; df -h /root 2>/dev/null | tail -n1
+            echo "  URL: $url"
+            return 1
+        fi
+        echo "Retrying..."; ensure_dirs; sleep 2
     done
     if ! tar -tzf "$INSTALL_DIR/backhaul.tar.gz" >/dev/null 2>&1; then
         fail "Downloaded file is not a valid archive."; rm -f "$INSTALL_DIR/backhaul.tar.gz"; return 1
@@ -122,6 +143,7 @@ ensure_backhaul() {
 }
 
 ensure_tls_cert() {
+    ensure_dirs || return 1
     [ -f "$INSTALL_DIR/server.crt" ] && [ -f "$INSTALL_DIR/server.key" ] && return 0
     echo "Generating a self-signed TLS certificate for wss/wssmux..."
     openssl req -x509 -newkey rsa:2048 -nodes \
@@ -230,6 +252,7 @@ EOF
 # =============================================================================
 install_iran() {
     title "Iran server (server side)"
+    ensure_dirs || return 1
     local port inbound transport toml unit
 
     while true; do
@@ -292,6 +315,7 @@ install_iran() {
 #  Install — Kharej side (client)  —  supports MANY Iran servers
 # =============================================================================
 create_client() {  # ip port transport
+    ensure_dirs || return 1
     local ip="$1" port="$2" transport="$3" toml unit
     toml="$INSTALL_DIR/kharej-$(slug "$ip")-${port}.toml"
     unit="backhaul-kharej-$(slug "$ip")-${port}.service"
@@ -328,6 +352,7 @@ EOF
 
 install_kharej() {
     title "Kharej server (client side)"
+    ensure_dirs || return 1
     echo "One Kharej server can hold several tunnels at the same time —"
     echo "one independent service per Iran server."
     echo
@@ -375,7 +400,7 @@ install_flow() {
     esac
 
     echo
-    confirm "Run the system optimizer now (BBR, buffers, MTU, DNS, limits)?" && optimize_system
+    confirm "Run the system optimizer now (BBR, buffers, MTU, limits)?" && optimize_system
     confirm "Install/refresh the watchdog?" && setup_watchdog
 }
 
@@ -534,7 +559,7 @@ manage_services() {
 }
 
 # =============================================================================
-#  System optimizer (BBR + sysctl + MTU + DNS + ulimits)
+#  System optimizer (BBR + sysctl + MTU + ulimits)   — DNS is never touched
 # =============================================================================
 ensure_ulimits() {
     echo "-- file descriptor limits"
@@ -576,18 +601,8 @@ EOF
     ok "MTU 1400 pinned on ${iface} (persists after reboot)."
 }
 
-ensure_dns() {
-    echo "-- DNS 1.1.1.1 / 1.0.0.1 / 8.8.8.8"
-    chattr -i /etc/resolv.conf 2>/dev/null
-    [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
-    cat > /etc/resolv.conf << 'EOF'
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-nameserver 8.8.8.8
-EOF
-    chattr +i /etc/resolv.conf 2>/dev/null
-    ok "DNS pinned (/etc/resolv.conf is now static and locked with chattr +i)."
-}
+# NOTE: DNS is intentionally left alone. This script never edits
+# /etc/resolv.conf and never runs chattr on it.
 
 optimize_system() {
     title "System optimizer"
@@ -635,9 +650,8 @@ EOF
 
     ensure_ulimits
     ensure_mtu
-    ensure_dns
     echo
-    ok "Optimization complete."
+    ok "Optimization complete (DNS untouched)."
 }
 
 # =============================================================================
@@ -823,13 +837,12 @@ uninstall_all() {
     rm -rf "$INSTALL_DIR"
     ok "Services and configs removed."
 
-    if confirm "Also revert the system tuning (sysctl / MTU / DNS lock)?"; then
+    if confirm "Also revert the system tuning (sysctl / MTU)?"; then
         systemctl disable --now backhaul-mtu.service >/dev/null 2>&1
         rm -f /etc/systemd/system/backhaul-mtu.service /etc/sysctl.d/99-backhaul-tunnel.conf
-        chattr -i /etc/resolv.conf 2>/dev/null
         systemctl daemon-reload
         sysctl --system >/dev/null 2>&1
-        ok "System tuning reverted (a reboot fully restores MTU/DNS)."
+        ok "System tuning reverted (a reboot fully restores the MTU)."
     else
         warn "System tuning left in place."
     fi
@@ -841,12 +854,12 @@ uninstall_all() {
 while true; do
     echo
     hr
-    echo -e "  ${CB}Backhaul Tunnel Manager — v8${C0}    services: $(list_units | grep -c .)"
+    echo -e "  ${CB}Backhaul Tunnel Manager — v8.1${C0}    services: $(list_units | grep -c .)"
     hr
     echo "  1) Install / add a tunnel"
     echo "  2) Status"
     echo "  3) Manage services  (start/stop/logs/config/ports/delete)"
-    echo "  4) System optimizer (BBR, buffers, MTU, DNS, limits)"
+    echo "  4) System optimizer (BBR, buffers, MTU, limits)"
     echo "  5) Install / repair watchdog"
     echo "  6) Uninstall"
     echo "  0) Exit"
