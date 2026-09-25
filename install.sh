@@ -1,6 +1,22 @@
 #!/bin/bash
 # =============================================================================
-#  Backhaul Tunnel Manager  (Iran <-> Kharej)  —  v8.2
+#  Backhaul Tunnel Manager  (Iran <-> Kharej)  —  v8.3
+#
+#  v8.3 fixes
+#   * heartbeat was hardcoded to 10s on the Iran (server) side. On a lossy
+#     link, a couple of missed heartbeats was enough for backhaul to tear
+#     the WHOLE tunnel down and let systemd restart it — every ~30-100s in
+#     practice, which is far more disruptive than one dropped sub-connection
+#     recovering on its own. heartbeat is now an install-time prompt
+#     (default 30s) so it can be tuned to the actual link instead of being
+#     fixed for everyone.
+#   * net.ipv4.tcp_user_timeout was 20000ms — low enough to kill a socket
+#     with pending-but-unacked data before ordinary TCP retransmission got a
+#     chance to recover from a brief hiccup. Raised to 60000ms. Existing
+#     installs are migrated automatically when the script starts.
+#   * Startup now warns (once) if an existing Iran config is still on the
+#     old heartbeat=10 default, so you know to bump it by hand
+#     (menu 3 -> pick the service -> 6, edit config).
 #
 #  v8.2 fixes
 #   * StartLimitIntervalSec moved from [Service] to [Unit] — modern systemd
@@ -270,13 +286,34 @@ migrate_units() {  # v8.1 and older put StartLimit* in [Service] -> systemd igno
     fi
 }
 
+migrate_sysctl_timeout() {  # v8.2 and older shipped tcp_user_timeout=20000, which could
+                            # kill a socket before ordinary TCP retransmission recovered
+                            # from a brief hiccup. Bump it in place if found.
+    local f="/etc/sysctl.d/99-backhaul-tunnel.conf"
+    [ -f "$f" ] || return 0
+    if grep -q "^net.ipv4.tcp_user_timeout=20000" "$f"; then
+        sed -i 's/^net.ipv4.tcp_user_timeout=20000/net.ipv4.tcp_user_timeout=60000/' "$f"
+        sysctl -w net.ipv4.tcp_user_timeout=60000 >/dev/null 2>&1
+        ok "Raised net.ipv4.tcp_user_timeout to 60000ms (was 20000ms — too eager to kill sockets on a brief hiccup)."
+    fi
+}
+
+warn_old_heartbeat() {  # one-time nudge only — never edits anyone's config automatically
+    local f found=0
+    for f in "$INSTALL_DIR"/iran-*.toml; do
+        [ -f "$f" ] || continue
+        grep -q '^heartbeat = 10$' "$f" && found=1
+    done
+    [ "$found" = "1" ] && warn "One or more Iran configs still use heartbeat=10 (the old default). If this tunnel flaps/restarts often, raise it: menu 3 -> pick the service -> 6 (try 30), then restart."
+}
+
 # =============================================================================
 #  Install — Iran side (server)
 # =============================================================================
 install_iran() {
     title "Iran server (server side)"
     ensure_dirs || return 1
-    local port inbound transport toml unit
+    local port inbound transport toml unit heartbeat
 
     while true; do
         port=$(ask "Tunnel port" "$(gen_port)")
@@ -286,6 +323,10 @@ install_iran() {
     while true; do
         inbound=$(ask "Inbound ports on this server (comma separated, e.g. 2050,2087)" "")
         [ -n "$inbound" ] && break || fail "At least one inbound port is required."
+    done
+    while true; do
+        heartbeat=$(ask "Heartbeat interval in seconds (raise this if the tunnel flaps/restarts on a lossy link)" "30")
+        [[ "$heartbeat" =~ ^[0-9]+$ ]] && [ "$heartbeat" -ge 5 ] && break || fail "Enter a number >= 5."
     done
 
     ensure_backhaul || return 1
@@ -302,7 +343,7 @@ install_iran() {
         echo "keepalive_period = 20"
         echo "nodelay = true"
         echo "channel_size = 16384"
-        echo "heartbeat = 10"
+        echo "heartbeat = ${heartbeat}"
         echo "mux_con = 8"
         case "$transport" in wss|wssmux)
             echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
@@ -329,7 +370,7 @@ install_iran() {
     rm -f "$WD_STATE/$unit.paused"
     systemctl daemon-reload
     systemctl enable --now "$unit" >/dev/null 2>&1
-    ok "Iran server started on port ${port} (${transport})."
+    ok "Iran server started on port ${port} (${transport}, heartbeat ${heartbeat}s)."
     echo
     echo "  >>> On the Kharej server, enter this server's IP and port ${port}."
 }
@@ -642,11 +683,11 @@ net.core.rmem_max=134217728
 net.core.wmem_max=134217728
 net.ipv4.tcp_rmem=4096 87380 134217728
 net.ipv4.tcp_wmem=4096 65536 134217728
-# fast dead-peer / packet-loss detection
+# dead-peer / packet-loss detection (tolerant of a brief hiccup, still bounded)
 net.ipv4.tcp_keepalive_time=30
 net.ipv4.tcp_keepalive_intvl=5
 net.ipv4.tcp_keepalive_probes=4
-net.ipv4.tcp_user_timeout=20000
+net.ipv4.tcp_user_timeout=60000
 net.ipv4.tcp_retries2=6
 net.ipv4.tcp_syn_retries=2
 net.ipv4.tcp_fin_timeout=15
@@ -875,11 +916,13 @@ uninstall_all() {
 #  Main menu
 # =============================================================================
 migrate_units
+migrate_sysctl_timeout
+warn_old_heartbeat
 
 while true; do
     echo
     hr
-    echo -e "  ${CB}Backhaul Tunnel Manager — v8.2${C0}    services: $(list_units | grep -c .)"
+    echo -e "  ${CB}Backhaul Tunnel Manager — v8.3${C0}    services: $(list_units | grep -c .)"
     hr
     echo "  1) Install / add a tunnel"
     echo "  2) Status"
