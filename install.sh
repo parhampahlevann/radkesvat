@@ -1,19 +1,25 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v7
+# Backhaul Tunnel Manager (Iran <-> Kharej) — v8
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
 #
-# v7 changes vs v6:
-#   - Rewritten sysctl profile (larger buffers/backlogs, BBR+fq, faster keepalive/timeouts)
-#   - Tighter server/client tunnel config (faster heartbeat, bigger channel, aggressive pool)
-#   - Hardened systemd unit (instant restart, no OOM kill, unlimited fds)
-#   - New watchdog: checks every 10s per-service, restarts on inactive service OR
-#     30s with zero established connections on the tunnel port
-#   - MTU pinned to 1400 on the default interface, persisted via a oneshot systemd unit
-#   - DNS pinned to 1.1.1.1 / 1.0.0.1 / 8.8.8.8 (static /etc/resolv.conf)
-#   - System-wide file descriptor limits raised (fs.file-max + limits.conf)
+# v8 changes vs v7:
+#   - IPv6 tunnel link: the tunnel between Iran server and Kharej client can now run over
+#     IPv4 OR IPv6 (you are asked during setup).
+#         Iran server  : bind_addr   = "0.0.0.0:PORT"   (IPv4)   or   "[::]:PORT"   (IPv6, dual-stack)
+#         Kharej client: remote_addr = "IP:PORT"        (IPv4)   or   "[IPv6]:PORT"
+#   - Multiple Iran servers: when setting up the Kharej server the script asks how many Iran
+#     servers you have, then for EACH one asks IPv4/IPv6, the address and the tunnel port.
+#     One client service is created per Iran server, so the Kharej server is tunnelled to
+#     all of them at the same time.
+#   - Watchdog is IPv6-aware and now matches connections by the service's own PID, so several
+#     tunnels on the same machine (even with the same port number) can't mask each other.
+#   - Fixes: "n" at the final prompts no longer exits the script (set -e), optimizer can be
+#     re-run (resolv.conf immutable flag), "Manage inbound ports" no longer corrupts the
+#     [server] header, service lists no longer break on the "●" bullet.
 #
-# Run this SEPARATELY on each server (Iran and Kharej). No SSH auto-sync — keep it simple.
+# Run this SEPARATELY on each server (every Iran server + the Kharej server).
+# Order: set up the Iran server(s) first, note their IP / tunnel port, then run the Kharej setup.
 
 set -e
 
@@ -38,7 +44,15 @@ mkdir -p "$INSTALL_DIR"
 # ============================================================
 
 detect_public_ip() {
-    curl -fsSL -4 https://ifconfig.me 2>/dev/null || curl -fsSL -4 https://api.ipify.org 2>/dev/null || echo ""
+    curl -fsSL -4 --max-time 6 https://ifconfig.me 2>/dev/null \
+        || curl -fsSL -4 --max-time 6 https://api.ipify.org 2>/dev/null \
+        || echo ""
+}
+
+detect_public_ip6() {
+    curl -fsSL -6 --max-time 6 https://ifconfig.me 2>/dev/null \
+        || curl -fsSL -6 --max-time 6 https://api6.ipify.org 2>/dev/null \
+        || echo ""
 }
 
 detect_default_iface() {
@@ -115,6 +129,121 @@ gen_port() {
     echo $(( (RANDOM % 40000) + 20000 ))
 }
 
+ask_yn() {
+    # usage: ask_yn "Question?" [y|n]   -> returns 0 for yes, 1 for no
+    local prompt="$1" def="${2:-n}" ans
+    read -p "$prompt [$def]: " ans
+    ans=${ans:-$def}
+    case "$ans" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+list_backhaul_units() {
+    systemctl list-units --all --plain --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}'
+}
+
+list_tunnel_units() {
+    # tunnel services only (no MTU / watchdog helper units)
+    list_backhaul_units | grep -vE '^backhaul-(mtu|watchdog)\.service$' || true
+}
+
+# ---------- IP / port validation + formatting (IPv4 and IPv6) ----------
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+valid_ipv4() {
+    local ip="$1" o
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do
+        [ "$o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+valid_ipv6() {
+    local ip="$1" colons
+    [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]] || return 1
+    colons="${ip//[^:]/}"
+    [ "${#colons}" -ge 2 ] || return 1
+    return 0
+}
+
+clean_ip_input() {
+    # strip spaces and [ ] brackets the user may have typed around an IPv6 address
+    local ip="$1"
+    ip="${ip//[[:space:]]/}"
+    ip="${ip//\[/}"
+    ip="${ip//\]/}"
+    echo "$ip"
+}
+
+format_hostport() {
+    # IPv6 literals must be wrapped in [] when followed by :port
+    local host="$1" port="$2"
+    if [[ "$host" == *:* ]]; then
+        echo "[${host}]:${port}"
+    else
+        echo "${host}:${port}"
+    fi
+}
+
+make_tag() {
+    # filesystem/systemd-safe tag from an IP address
+    echo "$1" | tr ':.' '__'
+}
+
+has_global_ipv6() {
+    ip -6 addr show scope global 2>/dev/null | grep -q "inet6"
+}
+
+check_reachable() {
+    # quick TCP probe (works for IPv4 and IPv6 literals)
+    local host="$1" port="$2"
+    timeout 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
+}
+
+IP_MODE=4
+ask_ip_version() {
+    # sets global IP_MODE to 4 or 6
+    local prompt="$1" c
+    echo ""
+    echo "$prompt"
+    echo "  1) IPv4"
+    echo "  2) IPv6"
+    read -p "Enter choice [1-2] (default 1): " c
+    case "$c" in
+        2) IP_MODE=6 ;;
+        *) IP_MODE=4 ;;
+    esac
+}
+
+prepare_ipv6() {
+    # Make sure IPv6 is enabled in the kernel and listeners are dual-stack.
+    # Returns 1 if the user wants to go back (no global IPv6 on this host).
+    local conf="/etc/sysctl.d/98-backhaul-ipv6.conf"
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1 || true
+    cat > "$conf" << EOF
+-net.ipv6.conf.all.disable_ipv6=0
+-net.ipv6.conf.default.disable_ipv6=0
+-net.ipv6.bindv6only=0
+EOF
+    if has_global_ipv6; then
+        return 0
+    fi
+    echo "Warning: no global (public) IPv6 address was detected on this server."
+    echo "         An IPv6 tunnel will not work until the server gets an IPv6 address."
+    if ask_yn "Continue with IPv6 anyway?" n; then
+        return 0
+    fi
+    return 1
+}
+
 # ============================================================
 # MTU pinning (persisted across reboots via a oneshot systemd unit)
 # ============================================================
@@ -154,6 +283,8 @@ EOF
 ensure_dns() {
     echo ""
     echo "=== Setting DNS to 1.1.1.1 / 1.0.0.1 / 8.8.8.8 ==="
+    # Drop the immutable flag from a previous run, otherwise rewriting the file fails.
+    chattr -i /etc/resolv.conf 2>/dev/null || true
     if [ -L /etc/resolv.conf ]; then
         # Usually managed by systemd-resolved — replace the symlink with a static file
         # so it isn't reset. This detaches this host from systemd-resolved's stub DNS.
@@ -228,6 +359,7 @@ optimize_system() {
     sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
 
     # Kept from the original profile — not superseded by the new list.
+    # (net.ipv4.tcp_* settings apply to IPv6 TCP sockets too.)
     sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
     sysctl -w net.ipv4.tcp_timestamps=1 > /dev/null 2>&1
     sysctl -w net.ipv4.tcp_sack=1 > /dev/null 2>&1
@@ -242,6 +374,8 @@ optimize_system() {
     # Deliberately NOT set (can backfire on newer kernels / behind NAT-CGNAT):
     #   net.ipv4.tcp_tw_recycle   (removed in modern kernels)
     #   net.ipv4.tcp_tw_reuse=1   (can break behind NAT/CGNAT)
+    # Deliberately NOT set: net.ipv6.conf.all.forwarding (would stop the host accepting
+    # IPv6 router advertisements and can silently kill its IPv6 connectivity).
 
     cat > /etc/sysctl.d/99-backhaul-tunnel.conf << EOF
 net.core.default_qdisc=fq
@@ -294,8 +428,12 @@ setup_watchdog() {
 # Backhaul watchdog — runs every 10s via backhaul-watchdog.timer
 # Restarts a service if:
 #   1) it is not active, OR
-#   2) it has been active but with zero established connections on its
-#      tunnel port for WATCHDOG_IDLE_THRESHOLD seconds (link looks dead/hung).
+#   2) it has been active but with zero established tunnel connections for
+#      IDLE_THRESHOLD seconds (link looks dead/hung).
+#
+# Works with IPv4 and IPv6 tunnels, and with several tunnel services on one machine
+# (e.g. a Kharej server connected to multiple Iran servers): each service is judged
+# only by the connections that belong to its own process.
 
 INSTALL_DIR="/root/backhaul-core"
 STATE_DIR="$INSTALL_DIR/watchdog-state"
@@ -304,7 +442,7 @@ IDLE_THRESHOLD=30
 
 mkdir -p "$STATE_DIR"
 
-for unit in $(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}'); do
+for unit in $(systemctl list-units --all --plain --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}'); do
     case "$unit" in
         backhaul-mtu.service|backhaul-watchdog.service) continue ;;
     esac
@@ -320,15 +458,22 @@ for unit in $(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev
     toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "$unit_file" 2>/dev/null | head -n1)
     [ -z "$toml" ] || [ ! -f "$toml" ] && continue
 
-    port=""
-    if grep -q '^\[server\]' "$toml" 2>/dev/null; then
-        port=$(grep -oE 'bind_addr = "0\.0\.0\.0:[0-9]+"' "$toml" | grep -oE '[0-9]+$')
-    else
-        port=$(grep -oE 'remote_addr = "[^:"]+:[0-9]+"' "$toml" | grep -oE '[0-9]+$')
-    fi
+    # Tunnel port = last number of bind_addr (server) or remote_addr (client).
+    # Handles "0.0.0.0:443", "[::]:443", "1.2.3.4:443" and "[2001:db8::1]:443".
+    port=$(grep -E '^(bind_addr|remote_addr)[[:space:]]*=' "$toml" | head -n1 | grep -oE '[0-9]+"$' | tr -d '"')
     [ -z "$port" ] && continue
 
-    active_conns=$(ss -H -tn state established "( sport = :${port} or dport = :${port} )" 2>/dev/null | grep -c .)
+    pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null)
+    [ -z "$pid" ] || [ "$pid" = "0" ] && continue
+
+    if grep -q '^\[server\]' "$toml" 2>/dev/null; then
+        # Iran side: connections accepted on the tunnel port
+        active_conns=$(ss -H -tn state established "( sport = :${port} )" 2>/dev/null | grep -c .)
+    else
+        # Kharej side: connections of THIS service's process to the tunnel port
+        active_conns=$(ss -H -tnp state established "( dport = :${port} )" 2>/dev/null | grep -c "pid=${pid},")
+    fi
+
     now=$(date +%s)
     state_file="${STATE_DIR}/${unit}.last_ok"
 
@@ -381,10 +526,25 @@ EOF
 # ============================================================
 
 show_status() {
+    local units tunnel_units u toml addr state warn found_warning
+
+    units=$(list_backhaul_units)
+    tunnel_units=$(list_tunnel_units)
+
+    if [ -n "$tunnel_units" ]; then
+        echo ""
+        echo "=== Tunnel summary (service / state / address) ==="
+        for u in $tunnel_units; do
+            toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "/etc/systemd/system/${u}" 2>/dev/null | head -n1)
+            addr=""
+            [ -n "$toml" ] && addr=$(grep -E '^(bind_addr|remote_addr)' "$toml" 2>/dev/null | head -n1 | cut -d'"' -f2)
+            state=$(systemctl is-active "$u" 2>/dev/null || true)
+            printf '%-55s %-10s %s\n' "$u" "$state" "$addr"
+        done
+    fi
+
     echo ""
     echo "=== Backhaul services ==="
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
     if [ -z "$units" ]; then
         echo "No Backhaul services found."
     else
@@ -396,13 +556,9 @@ show_status() {
     fi
 
     echo "=== Recent warnings (token mismatch / connection issues) ==="
-    local found_warning=0
-    for u in $units; do
-        case "$u" in
-            backhaul-mtu.service|backhaul-watchdog.service) continue ;;
-        esac
-        local warn
-        warn=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed" | tail -n 3)
+    found_warning=0
+    for u in $tunnel_units; do
+        warn=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed|unreachable|refused" | tail -n 3)
         if [ -n "$warn" ]; then
             found_warning=1
             echo "--- $u ---"
@@ -415,6 +571,8 @@ show_status() {
         echo ""
         echo "If you see 'invalid security token', the token in the .toml files on the"
         echo "two servers does not match — check with: grep token ${INSTALL_DIR}/*.toml"
+        echo "If you see 'network is unreachable' on an IPv6 tunnel, the server has no working IPv6 route"
+        echo "(or the IPv6 firewall blocks the tunnel port)."
     fi
 
     if [ -f "$WATCHDOG_LOG" ]; then
@@ -429,7 +587,9 @@ show_status() {
 # ============================================================
 
 manage_ports() {
-    local tomls
+    local tomls TOML_FILE PCHOICE SERVICE_NAME NEWPORT OLDPORT p i found line_no end_line tmp
+    local -a CUR_PORTS=() NEW_PORTS=()
+
     tomls=$(ls "$INSTALL_DIR"/iran*.toml 2>/dev/null || true)
     if [ -z "$tomls" ]; then
         echo "No Iran server config found on this machine. Run this on the Iran server."
@@ -442,53 +602,78 @@ manage_ports() {
         echo "Invalid selection."
     done
 
+    mapfile -t CUR_PORTS < <(sed -n '/^ports = \[/,/^\]/p' "$TOML_FILE" | grep -oE '"[^"]+"' | tr -d '"')
+
     echo ""
     echo "Current ports:"
-    sed -n '/ports = \[/,/\]/p' "$TOML_FILE"
+    for p in "${CUR_PORTS[@]}"; do
+        echo "  - $p"
+    done
 
     echo ""
     echo "1) Add a port"
     echo "2) Remove a port"
     read -p "Choice [1-2]: " PCHOICE
 
-    PORT_NUM=$(basename "$TOML_FILE" | grep -oE '[0-9]+' | head -n1)
-    SERVICE_NAME="backhaul-iran${PORT_NUM}.service"
+    SERVICE_NAME="backhaul-$(basename "$TOML_FILE" .toml).service"
 
     if [ "$PCHOICE" = "1" ]; then
-        read -p "Port to add: " NEWPORT
-        sed -i "s/\]/    \"${NEWPORT}\"\n]/" "$TOML_FILE"
-        # normalize: ensure previous last line got a trailing comma
-        python3 - "$TOML_FILE" << 'PYEOF' 2>/dev/null || true
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-lines = content.split("\n")
-out = []
-in_ports = False
-port_lines_idx = []
-for i, l in enumerate(lines):
-    if 'ports = [' in l:
-        in_ports = True
-    if in_ports and l.strip().startswith('"'):
-        port_lines_idx.append(i)
-    if in_ports and l.strip() == ']':
-        in_ports = False
-for idx_pos, i in enumerate(port_lines_idx):
-    l = lines[i].rstrip(',').rstrip()
-    if idx_pos != len(port_lines_idx) - 1:
-        lines[i] = l + ","
-    else:
-        lines[i] = l
-with open(path, "w") as f:
-    f.write("\n".join(lines))
-PYEOF
+        read -p "Port to add (e.g. 443, 443=8443, 1000-1010): " NEWPORT
+        if [ -z "$NEWPORT" ]; then
+            echo "Nothing entered."
+            return
+        fi
+        CUR_PORTS+=("$NEWPORT")
         echo "Added port ${NEWPORT}."
-    else
-        read -p "Port to remove: " OLDPORT
-        sed -i "/\"${OLDPORT}\"/d" "$TOML_FILE"
+    elif [ "$PCHOICE" = "2" ]; then
+        read -p "Port entry to remove (exactly as listed above): " OLDPORT
+        found=0
+        for p in "${CUR_PORTS[@]}"; do
+            if [ "$p" = "$OLDPORT" ]; then
+                found=1
+            else
+                NEW_PORTS+=("$p")
+            fi
+        done
+        if [ "$found" = "0" ]; then
+            echo "Port entry '${OLDPORT}' not found."
+            return
+        fi
+        if [ "${#NEW_PORTS[@]}" -eq 0 ]; then
+            echo "Cannot remove the last port — Backhaul needs at least one. Use the service menu to delete the tunnel instead."
+            return
+        fi
+        CUR_PORTS=("${NEW_PORTS[@]}")
         echo "Removed port ${OLDPORT}."
+    else
+        echo "Invalid choice."
+        return
     fi
+
+    # Rebuild only the ports = [ ... ] block; everything else in the file is preserved.
+    line_no=$(grep -n '^ports = \[' "$TOML_FILE" | head -n1 | cut -d: -f1)
+    if [ -z "$line_no" ]; then
+        echo "Could not find the 'ports = [' block in $TOML_FILE — nothing changed."
+        return
+    fi
+    end_line=$(awk -v s="$line_no" 'NR>s && /^\]/ {print NR; exit}' "$TOML_FILE")
+    [ -z "$end_line" ] && end_line="$line_no"
+
+    tmp="${TOML_FILE}.tmp"
+    head -n $((line_no - 1)) "$TOML_FILE" > "$tmp"
+    {
+        echo "ports = ["
+        for i in "${!CUR_PORTS[@]}"; do
+            if [ $((i+1)) -eq ${#CUR_PORTS[@]} ]; then
+                echo "    \"${CUR_PORTS[i]}\""
+            else
+                echo "    \"${CUR_PORTS[i]}\","
+            fi
+        done
+        echo "]"
+    } >> "$tmp"
+    tail -n +$((end_line + 1)) "$TOML_FILE" >> "$tmp"
+    mv "$tmp" "$TOML_FILE"
 
     systemctl restart "$SERVICE_NAME"
     echo "Restarted $SERVICE_NAME."
@@ -499,8 +684,8 @@ PYEOF
 # ============================================================
 
 manage_services() {
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}' | grep -vE '^backhaul-(mtu|watchdog)\.service$')
+    local units SERVICE_NAME TOML_FILE SCHOICE
+    units=$(list_tunnel_units)
     if [ -z "$units" ]; then
         echo "No Backhaul tunnel services found on this server."
         return
@@ -513,7 +698,6 @@ manage_services() {
         echo "Invalid selection."
     done
 
-    local TOML_FILE
     TOML_FILE=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "/etc/systemd/system/${SERVICE_NAME}" | head -n1)
 
     while true; do
@@ -542,16 +726,17 @@ manage_services() {
             5) journalctl -u "$SERVICE_NAME" -f ;;
             6) systemctl enable "$SERVICE_NAME"; echo "Enabled." ;;
             7) systemctl disable "$SERVICE_NAME"; echo "Disabled." ;;
-            8) [ -n "$TOML_FILE" ] && cat "$TOML_FILE" || echo "Config path not found." ;;
+            8) if [ -n "$TOML_FILE" ]; then cat "$TOML_FILE"; else echo "Config path not found."; fi ;;
             9) if [ -n "$TOML_FILE" ]; then
                    ${EDITOR:-nano} "$TOML_FILE"
-                   read -p "Restart service to apply changes? (y/n): " R
-                   [ "$R" = "y" ] && systemctl restart "$SERVICE_NAME" && echo "Restarted."
+                   if ask_yn "Restart service to apply changes?" y; then
+                       systemctl restart "$SERVICE_NAME"
+                       echo "Restarted."
+                   fi
                else
                    echo "Config path not found."
                fi ;;
-            10) read -p "Delete $SERVICE_NAME and its config? (y/n): " D
-                if [ "$D" = "y" ]; then
+            10) if ask_yn "Delete $SERVICE_NAME and its config?" n; then
                     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
                     rm -f "/etc/systemd/system/${SERVICE_NAME}"
                     [ -n "$TOML_FILE" ] && rm -f "$TOML_FILE"
@@ -570,14 +755,13 @@ manage_services() {
 # ============================================================
 
 uninstall_all() {
-    read -p "This will remove ALL Backhaul services (including watchdog/MTU units) on THIS server. Continue? (y/n): " CONFIRM
-    if [ "$CONFIRM" != "y" ]; then
+    local units u
+    if ! ask_yn "This will remove ALL Backhaul services (including watchdog/MTU units) on THIS server. Continue?" n; then
         echo "Cancelled."
         return
     fi
 
-    local units
-    units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
+    units=$(list_backhaul_units)
     for u in $units; do
         systemctl disable --now "$u" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$u"
@@ -587,8 +771,293 @@ uninstall_all() {
 
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
-    echo "Uninstalled. (Note: MTU/DNS/sysctl system tuning was left in place — re-run and choose"
+    echo "Uninstalled. (Note: MTU/DNS/sysctl/IPv6 system tuning was left in place — re-run and choose"
     echo "the optimizer options manually to revert those if needed.)"
+}
+
+# ============================================================
+# Install: shared pieces
+# ============================================================
+
+write_service() {
+    # $1 = unit name (without .service), $2 = description, $3 = toml path
+    cat > "/etc/systemd/system/$1.service" << EOF
+[Unit]
+Description=$2
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${INSTALL_DIR}/backhaul -c $3
+Restart=always
+RestartSec=1
+StartLimitIntervalSec=0
+LimitNOFILE=1048576
+TasksMax=infinity
+LimitMEMLOCK=infinity
+OOMScoreAdjust=-1000
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_client_toml() {
+    # $1 = toml path, $2 = remote_addr (already formatted, IPv6 in [])
+    cat > "$1" << EOF
+[client]
+remote_addr = "$2"
+transport = "${TRANSPORT}"
+token = "${TOKEN}"
+connection_pool = 8
+aggressive_pool = true
+keepalive_period = 20
+nodelay = true
+retry_interval = 1
+sniffer = false
+web_port = 0
+log_level = "warn"
+EOF
+}
+
+# ============================================================
+# Install: Iran server side
+# ============================================================
+
+setup_iran_server() {
+    local bind_addr guess public_ip default_port port i
+    local -a PORT_ARRAY=()
+
+    # --- IP version of the tunnel listener ---
+    while true; do
+        echo ""
+        echo "(IPv4 listens on 0.0.0.0:PORT. IPv6 listens on [::]:PORT, which normally accepts"
+        echo " BOTH IPv6 and IPv4 Kharej clients, so IPv6 is the most flexible choice.)"
+        ask_ip_version "Which IP version should the tunnel use on this Iran server?"
+        if [ "$IP_MODE" = "6" ]; then
+            if prepare_ipv6; then
+                break
+            fi
+            echo "Pick again."
+        else
+            break
+        fi
+    done
+
+    if [ "$IP_MODE" = "6" ]; then
+        guess=$(detect_public_ip6)
+    else
+        guess=$(detect_public_ip)
+    fi
+    read -p "This Iran server's public IPv${IP_MODE} (shown to you for the Kharej setup) [${guess}]: " public_ip
+    public_ip=${public_ip:-$guess}
+    public_ip=$(clean_ip_input "$public_ip")
+
+    # --- Tunnel port ---
+    default_port=$(gen_port)
+    while true; do
+        read -p "Tunnel port [${default_port}]: " TUNNEL_PORT
+        TUNNEL_PORT=${TUNNEL_PORT:-$default_port}
+        if valid_port "$TUNNEL_PORT"; then
+            break
+        fi
+        echo "Invalid port (1-65535)."
+    done
+
+    # --- Inbound (user-facing) ports ---
+    while true; do
+        read -p "Inbound ports on this Iran server (comma separated, e.g. 2050,2023): " INBOUND_PORTS
+        if [ -n "${INBOUND_PORTS// /}" ]; then
+            break
+        fi
+        echo "Enter at least one port."
+    done
+
+    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
+        ensure_tls_cert_local
+    fi
+
+    if [ "$IP_MODE" = "6" ]; then
+        bind_addr="[::]:${TUNNEL_PORT}"
+    else
+        bind_addr="0.0.0.0:${TUNNEL_PORT}"
+    fi
+
+    TOML_FILE="$INSTALL_DIR/iran${TUNNEL_PORT}.toml"
+    {
+        echo "[server]"
+        echo "bind_addr = \"${bind_addr}\""
+        echo "transport = \"${TRANSPORT}\""
+        echo "token = \"${TOKEN}\""
+        echo "keepalive_period = 20"
+        echo "nodelay = true"
+        echo "channel_size = 16384"
+        echo "heartbeat = 15"
+        echo "mux_con = 8"
+        if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
+            echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
+            echo "tls_key = \"${INSTALL_DIR}/server.key\""
+        fi
+        echo "sniffer = false"
+        echo "web_port = 0"
+        echo "log_level = \"warn\""
+        echo ""
+        echo "ports = ["
+    } > "$TOML_FILE"
+    IFS=',' read -ra PORT_ARRAY <<< "$INBOUND_PORTS"
+    for i in "${!PORT_ARRAY[@]}"; do
+        port=$(echo "${PORT_ARRAY[i]}" | xargs)
+        if [ $((i+1)) -eq ${#PORT_ARRAY[@]} ]; then
+            echo "    \"${port}\"" >> "$TOML_FILE"
+        else
+            echo "    \"${port}\"," >> "$TOML_FILE"
+        fi
+    done
+    echo "]" >> "$TOML_FILE"
+
+    write_service "backhaul-iran${TUNNEL_PORT}" "Backhaul Iran Server Port ${TUNNEL_PORT}" "$TOML_FILE"
+    systemctl daemon-reload
+    systemctl enable --now "backhaul-iran${TUNNEL_PORT}.service"
+    echo "Local Backhaul (Iran server side) started, listening on ${bind_addr}."
+
+    sleep 1
+    if ss -H -ltn "( sport = :${TUNNEL_PORT} )" 2>/dev/null | grep -q .; then
+        echo "Check: tunnel port ${TUNNEL_PORT} is listening."
+    else
+        echo "Warning: nothing is listening on tunnel port ${TUNNEL_PORT} yet — see: journalctl -u backhaul-iran${TUNNEL_PORT} -n 30"
+    fi
+
+    cat > "$STATE_FILE" << EOF
+LOCAL_ROLE=Iran
+TRANSPORT=${TRANSPORT}
+IP_VERSION=${IP_MODE}
+BIND_ADDR=${bind_addr}
+TUNNEL_PORT=${TUNNEL_PORT}
+PUBLIC_IP=${public_ip}
+EOF
+
+    echo ""
+    echo ">>> When you run this script on the Kharej server, add THIS Iran server with:"
+    echo "      IP version  : IPv${IP_MODE}"
+    echo "      Address     : ${public_ip}"
+    echo "      Tunnel port : ${TUNNEL_PORT}"
+    echo "      Transport   : ${TRANSPORT}   (choose the same transport on the Kharej server)"
+    echo ">>> Make sure the firewall allows TCP ${TUNNEL_PORT}$([ "$IP_MODE" = "6" ] && echo " for IPv6 as well (ip6tables / ufw with IPV6=yes)")."
+    echo ">>> Using several Iran servers? Run this script on each of them, then list them all on the Kharej server."
+}
+
+# ============================================================
+# Install: Kharej client side (one or many Iran servers)
+# ============================================================
+
+setup_kharej_clients() {
+    local count i k ip port prev_port="" dup addr tag name toml
+    local -a IPS=() PORTS=() SVCS=() TARGETS=()
+
+    echo ""
+    echo "This Kharej server can be tunnelled to several Iran servers at the same time"
+    echo "(one Backhaul client service is created per Iran server)."
+    while true; do
+        read -p "How many Iran servers should this Kharej server connect to? [1]: " count
+        count=${count:-1}
+        if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -ge 1 ] && [ "$count" -le 20 ]; then
+            break
+        fi
+        echo "Enter a number between 1 and 20."
+    done
+
+    for ((i=1; i<=count; i++)); do
+        echo ""
+        echo "==== Iran server #${i} of ${count} ===="
+        while true; do
+            ask_ip_version "Connect to Iran server #${i} over:"
+            if [ "$IP_MODE" = "6" ] && ! prepare_ipv6; then
+                echo "Pick again."
+                continue
+            fi
+
+            # address (must match the chosen IP version)
+            while true; do
+                read -p "Iran server #${i} public IPv${IP_MODE} address: " ip
+                ip=$(clean_ip_input "$ip")
+                if [ "$IP_MODE" = "6" ]; then
+                    if valid_ipv6 "$ip"; then break; fi
+                    echo "Not a valid IPv6 address (example: 2001:db8::10)."
+                else
+                    if valid_ipv4 "$ip"; then break; fi
+                    echo "Not a valid IPv4 address (example: 203.0.113.10)."
+                fi
+            done
+
+            # tunnel port of THAT Iran server (default: the previous server's port)
+            while true; do
+                read -p "Tunnel port of Iran server #${i} [${prev_port}]: " port
+                port=${port:-$prev_port}
+                if valid_port "$port"; then break; fi
+                echo "Invalid port (1-65535) — use the tunnel port shown when you set up that Iran server."
+            done
+
+            dup=0
+            for k in "${!IPS[@]}"; do
+                if [ "${IPS[k]}" = "$ip" ] && [ "${PORTS[k]}" = "$port" ]; then
+                    dup=1
+                fi
+            done
+            if [ "$dup" = "1" ]; then
+                echo "That Iran server (same address and port) was already added — enter a different one."
+                continue
+            fi
+            break
+        done
+
+        if check_reachable "$ip" "$port"; then
+            echo "  OK: $(format_hostport "$ip" "$port") is reachable."
+        else
+            echo "  Warning: $(format_hostport "$ip" "$port") is not reachable right now."
+            echo "           (Iran side not set up yet, firewall, or wrong IP version? The client keeps retrying every second.)"
+        fi
+
+        IPS+=("$ip")
+        PORTS+=("$port")
+        prev_port="$port"
+    done
+
+    # --- create one client service per Iran server ---
+    for k in "${!IPS[@]}"; do
+        ip="${IPS[k]}"
+        port="${PORTS[k]}"
+        addr=$(format_hostport "$ip" "$port")
+        tag=$(make_tag "$ip")
+        name="kharej-${tag}-${port}"
+        toml="$INSTALL_DIR/${name}.toml"
+
+        write_client_toml "$toml" "$addr"
+        write_service "backhaul-${name}" "Backhaul Kharej Client to ${addr}" "$toml"
+        SVCS+=("backhaul-${name}.service")
+        TARGETS+=("$addr")
+    done
+
+    systemctl daemon-reload
+    for k in "${!SVCS[@]}"; do
+        systemctl enable --now "${SVCS[k]}" >/dev/null 2>&1
+    done
+
+    echo ""
+    echo "Kharej client services started (one per Iran server):"
+    for k in "${!SVCS[@]}"; do
+        echo "  ${SVCS[k]}  ->  ${TARGETS[k]}"
+    done
+
+    cat > "$STATE_FILE" << EOF
+LOCAL_ROLE=Kharej
+TRANSPORT=${TRANSPORT}
+IRAN_SERVERS="${TARGETS[*]}"
+EOF
+
+    TUNNEL_PORT="${PORTS[*]}"
 }
 
 # ============================================================
@@ -606,14 +1075,8 @@ install_flow() {
         esac
     done
 
-    LOCAL_PUBLIC_IP_GUESS=$(detect_public_ip)
-    read -p "This server's public IP [${LOCAL_PUBLIC_IP_GUESS}]: " LOCAL_PUBLIC_IP
-    LOCAL_PUBLIC_IP=${LOCAL_PUBLIC_IP:-$LOCAL_PUBLIC_IP_GUESS}
-
-    read -p "The OTHER server's public IP: " PEER_PUBLIC_IP
-
     echo ""
-    echo "Choose transport:"
+    echo "Choose transport (must be the SAME on the Iran server(s) and the Kharej server):"
     echo "  1) wss     - TLS encrypted, looks like HTTPS to firewalls (recommended)"
     echo "  2) wssmux  - wss + multiplexing, best for many concurrent connections / high throughput"
     echo "  3) tcp     - plain TCP, fastest but not encrypted or disguised"
@@ -626,162 +1089,36 @@ install_flow() {
         *) TRANSPORT="wss" ;;
     esac
 
-    # Token is fixed (as requested) — same on both servers, no prompt needed.
+    # Token is fixed (as requested) — same on every server, no prompt needed.
     # NOTE: this is much weaker than a random token. Anyone who guesses/knows
     # "123" can authenticate to your tunnel. Fine for quick testing, but
     # consider a random token (openssl rand -hex 24) for anything real.
     TOKEN="$FIXED_TOKEN"
 
-    # Tunnel port still has to match on both sides. Iran picks/generates it;
-    # Kharej must type in EXACTLY the same port Iran is using.
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        TUNNEL_PORT_DEFAULT=$(gen_port)
-        read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
-        TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
-        read -p "Inbound ports on the Iran server (comma separated, e.g. 2050,2023): " INBOUND_PORTS
-        IRAN_IP="$LOCAL_PUBLIC_IP"; KHAREJ_IP="$PEER_PUBLIC_IP"
-        echo ""
-        echo ">>> Tunnel port: $TUNNEL_PORT   (token is fixed: $TOKEN)"
-        echo ">>> Enter this EXACT port when you run this script on the Kharej server."
-    else
-        echo ""
-        echo "This MUST exactly match the port shown on the Iran server."
-        read -p "Enter the tunnel port used on the Iran server: " TUNNEL_PORT
-        KHAREJ_IP="$LOCAL_PUBLIC_IP"; IRAN_IP="$PEER_PUBLIC_IP"
-    fi
-
     ensure_backhaul_local
-    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-        if [ "$LOCAL_ROLE" = "Iran" ]; then
-            ensure_tls_cert_local
-        fi
-    fi
 
     if [ "$LOCAL_ROLE" = "Iran" ]; then
-        TOML_FILE="$INSTALL_DIR/iran${TUNNEL_PORT}.toml"
-        {
-            echo "[server]"
-            echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
-            echo "transport = \"${TRANSPORT}\""
-            echo "token = \"${TOKEN}\""
-            echo "keepalive_period = 20"
-            echo "nodelay = true"
-            echo "channel_size = 16384"
-            echo "heartbeat = 15"
-            echo "mux_con = 8"
-            if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-                echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
-                echo "tls_key = \"${INSTALL_DIR}/server.key\""
-            fi
-            echo "sniffer = false"
-            echo "web_port = 0"
-            echo "log_level = \"warn\""
-            echo ""
-            echo "ports = ["
-        } > "$TOML_FILE"
-        IFS=',' read -ra PORT_ARRAY <<< "$INBOUND_PORTS"
-        for i in "${!PORT_ARRAY[@]}"; do
-            port=$(echo "${PORT_ARRAY[i]}" | xargs)
-            if [ $((i+1)) -eq ${#PORT_ARRAY[@]} ]; then
-                echo "    \"${port}\"" >> "$TOML_FILE"
-            else
-                echo "    \"${port}\"," >> "$TOML_FILE"
-            fi
-        done
-        echo "]" >> "$TOML_FILE"
-
-        SERVICE_FILE="/etc/systemd/system/backhaul-iran${TUNNEL_PORT}.service"
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Backhaul Iran Server Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${TOML_FILE}
-Restart=always
-RestartSec=1
-StartLimitIntervalSec=0
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-OOMScoreAdjust=-1000
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-iran${TUNNEL_PORT}.service"
-        echo "Local Backhaul (Iran server side) started on port ${TUNNEL_PORT}."
+        setup_iran_server
     else
-        TOML_FILE="$INSTALL_DIR/kharej${TUNNEL_PORT}.toml"
-        cat > "$TOML_FILE" << EOF
-[client]
-remote_addr = "${IRAN_IP}:${TUNNEL_PORT}"
-transport = "${TRANSPORT}"
-token = "${TOKEN}"
-connection_pool = 8
-aggressive_pool = true
-keepalive_period = 20
-nodelay = true
-retry_interval = 1
-sniffer = false
-web_port = 0
-log_level = "warn"
-EOF
-        SERVICE_FILE="/etc/systemd/system/backhaul-kharej${TUNNEL_PORT}.service"
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Backhaul Kharej Client Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${TOML_FILE}
-Restart=always
-RestartSec=1
-StartLimitIntervalSec=0
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-OOMScoreAdjust=-1000
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-kharej${TUNNEL_PORT}.service"
-        echo "Local Backhaul (Kharej client side) started, connecting to ${IRAN_IP}:${TUNNEL_PORT}."
+        setup_kharej_clients
     fi
-
-    cat > "$STATE_FILE" << EOF
-LOCAL_ROLE=${LOCAL_ROLE}
-TUNNEL_PORT=${TUNNEL_PORT}
-IRAN_IP=${IRAN_IP}
-KHAREJ_IP=${KHAREJ_IP}
-TRANSPORT=${TRANSPORT}
-EOF
 
     echo ""
     echo "=== Setup Completed! ==="
-    echo "Tunnel port: $TUNNEL_PORT"
+    echo "Role: $LOCAL_ROLE   Transport: $TRANSPORT   Tunnel port(s): $TUNNEL_PORT"
     echo "Token: $TOKEN"
-    echo "Check: systemctl status 'backhaul-*'"
+    echo "Check: systemctl status 'backhaul-*'   (or menu option 2)"
     if [ "$TOKEN" = "123" ]; then
         echo "(Reminder: token is the fixed value '123' — fine for testing, weak for production.)"
     fi
 
-    read -p "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)? (y/n): " RUNOPT
-    [ "$RUNOPT" = "y" ] && optimize_system
+    if ask_yn "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)?" n; then
+        optimize_system
+    fi
 
-    read -p "Install the watchdog (auto-restart on dead/idle tunnel)? (y/n): " RUNWD
-    [ "$RUNWD" = "y" ] && setup_watchdog
+    if ask_yn "Install the watchdog (auto-restart on dead/idle tunnel)?" n; then
+        setup_watchdog
+    fi
 }
 
 # ============================================================
@@ -790,8 +1127,8 @@ EOF
 
 while true; do
     echo ""
-    echo "==== Backhaul Tunnel Manager (v7) ===="
-    echo "1) Install / Setup tunnel"
+    echo "==== Backhaul Tunnel Manager (v8) ===="
+    echo "1) Install / Setup tunnel (IPv4/IPv6, Kharej: multiple Iran servers)"
     echo "2) Show tunnel status"
     echo "3) Manage inbound ports (Iran side)"
     echo "4) Manage services (start/stop/restart/logs/edit)"
