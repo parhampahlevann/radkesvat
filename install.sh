@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v8
+# Backhaul Tunnel Manager (Iran <-> Kharej) — v9 Low-Traffic
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
 #
-# v8 changes vs v7:
+# v9 changes vs v8:
 #   - IPv6 tunnel link: the tunnel between Iran server and Kharej client can now run over
 #     IPv4 OR IPv6 (you are asked during setup).
 #         Iran server  : bind_addr   = "0.0.0.0:PORT"   (IPv4)   or   "[::]:PORT"   (IPv6, dual-stack)
@@ -30,7 +30,15 @@ FIXED_TOKEN="123"
 WATCHDOG_SCRIPT="$INSTALL_DIR/watchdog.sh"
 WATCHDOG_LOG="$INSTALL_DIR/watchdog.log"
 WATCHDOG_STATE_DIR="$INSTALL_DIR/watchdog-state"
-WATCHDOG_IDLE_THRESHOLD=30
+WATCHDOG_IDLE_THRESHOLD=0
+
+# Low-overhead tunnel defaults
+CLIENT_POOL=1
+CLIENT_AGGRESSIVE_POOL=false
+KEEPALIVE_PERIOD=30
+RETRY_INTERVAL=2
+SERVER_HEARTBEAT=30
+SERVER_MUX_CON=1
 
 if [ "$EUID" -ne 0 ]; then
     echo "Please run as root (sudo)."
@@ -425,20 +433,17 @@ setup_watchdog() {
 
     cat > "$WATCHDOG_SCRIPT" << 'WDEOF'
 #!/bin/bash
-# Backhaul watchdog — runs every 10s via backhaul-watchdog.timer
-# Restarts a service if:
-#   1) it is not active, OR
-#   2) it has been active but with zero established tunnel connections for
-#      IDLE_THRESHOLD seconds (link looks dead/hung).
-#
-# Works with IPv4 and IPv6 tunnels, and with several tunnel services on one machine
-# (e.g. a Kharej server connected to multiple Iran servers): each service is judged
-# only by the connections that belong to its own process.
+# Backhaul watchdog — runs every 15s via backhaul-watchdog.timer.
+# IMPORTANT: an idle tunnel is NOT a failed tunnel. We no longer restart a healthy
+# service merely because it has zero established user connections. That behavior
+# caused repeated TLS/handshake/reconnect traffic and unnecessary data usage.
+# The watchdog now restarts only inactive/crashed services; systemd handles the
+# normal process restart policy as well.
 
 INSTALL_DIR="/root/backhaul-core"
 STATE_DIR="$INSTALL_DIR/watchdog-state"
 LOG_FILE="$INSTALL_DIR/watchdog.log"
-IDLE_THRESHOLD=30
+IDLE_THRESHOLD=0
 
 mkdir -p "$STATE_DIR"
 
@@ -454,39 +459,12 @@ for unit in $(systemctl list-units --all --plain --no-legend 'backhaul-*.service
         continue
     fi
 
-    unit_file="/etc/systemd/system/${unit}"
-    toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "$unit_file" 2>/dev/null | head -n1)
-    [ -z "$toml" ] || [ ! -f "$toml" ] && continue
-
-    # Tunnel port = last number of bind_addr (server) or remote_addr (client).
-    # Handles "0.0.0.0:443", "[::]:443", "1.2.3.4:443" and "[2001:db8::1]:443".
-    port=$(grep -E '^(bind_addr|remote_addr)[[:space:]]*=' "$toml" | head -n1 | grep -oE '[0-9]+"$' | tr -d '"')
-    [ -z "$port" ] && continue
-
+    # Do NOT inspect established connections here. A completely idle tunnel is
+    # normal and restarting it creates needless reconnect/handshake traffic.
     pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null)
-    [ -z "$pid" ] || [ "$pid" = "0" ] && continue
-
-    if grep -q '^\[server\]' "$toml" 2>/dev/null; then
-        # Iran side: connections accepted on the tunnel port
-        active_conns=$(ss -H -tn state established "( sport = :${port} )" 2>/dev/null | grep -c .)
-    else
-        # Kharej side: connections of THIS service's process to the tunnel port
-        active_conns=$(ss -H -tnp state established "( dport = :${port} )" 2>/dev/null | grep -c "pid=${pid},")
-    fi
-
-    now=$(date +%s)
-    state_file="${STATE_DIR}/${unit}.last_ok"
-
-    if [ "${active_conns:-0}" -gt 0 ]; then
-        echo "$now" > "$state_file"
-    else
-        last_ok=$(cat "$state_file" 2>/dev/null || echo "$now")
-        idle=$(( now - last_ok ))
-        if [ "$idle" -ge "$IDLE_THRESHOLD" ]; then
-            systemctl restart "$unit" 2>/dev/null
-            echo "$now" > "$state_file"
-            echo "$(date '+%F %T') restarted $unit (idle ${idle}s, no established connections on port ${port})" >> "$LOG_FILE"
-        fi
+    if [ -z "$pid" ] || [ "$pid" = "0" ] || ! kill -0 "$pid" 2>/dev/null; then
+        systemctl restart "$unit" 2>/dev/null || true
+        echo "$(date '+%F %T') restarted $unit (missing/dead main process)" >> "$LOG_FILE"
     fi
 done
 WDEOF
@@ -503,11 +481,11 @@ EOF
 
     cat > /etc/systemd/system/backhaul-watchdog.timer << 'EOF'
 [Unit]
-Description=Run Backhaul Watchdog every 10 seconds
+Description=Run Backhaul Watchdog every 15 seconds
 
 [Timer]
 OnBootSec=20
-OnUnitActiveSec=10
+OnUnitActiveSec=15
 AccuracySec=1
 Unit=backhaul-watchdog.service
 
@@ -517,7 +495,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
-    echo "Watchdog installed — checks every 10s, restarts a tunnel after ${WATCHDOG_IDLE_THRESHOLD}s with no active connections."
+    echo "Watchdog installed — checks every 15s and restarts only crashed/inactive tunnel processes (idle tunnels are left alone)."
     echo "Log: $WATCHDOG_LOG"
 }
 
@@ -577,7 +555,7 @@ show_status() {
 
     if [ -f "$WATCHDOG_LOG" ]; then
         echo ""
-        echo "=== Last 10 watchdog restarts ==="
+        echo "=== Last 10 watchdog restarts (process-health only) ==="
         tail -n 10 "$WATCHDOG_LOG"
     fi
 }
@@ -812,11 +790,11 @@ write_client_toml() {
 remote_addr = "$2"
 transport = "${TRANSPORT}"
 token = "${TOKEN}"
-connection_pool = 8
-aggressive_pool = true
-keepalive_period = 20
+connection_pool = ${CLIENT_POOL}
+aggressive_pool = ${CLIENT_AGGRESSIVE_POOL}
+keepalive_period = ${KEEPALIVE_PERIOD}
 nodelay = true
-retry_interval = 1
+retry_interval = ${RETRY_INTERVAL}
 sniffer = false
 web_port = 0
 log_level = "warn"
@@ -892,11 +870,11 @@ setup_iran_server() {
         echo "bind_addr = \"${bind_addr}\""
         echo "transport = \"${TRANSPORT}\""
         echo "token = \"${TOKEN}\""
-        echo "keepalive_period = 20"
+        echo "keepalive_period = ${KEEPALIVE_PERIOD}"
         echo "nodelay = true"
         echo "channel_size = 16384"
-        echo "heartbeat = 15"
-        echo "mux_con = 8"
+        echo "heartbeat = ${SERVER_HEARTBEAT}"
+        echo "mux_con = ${SERVER_MUX_CON}"
         if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
             echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
             echo "tls_key = \"${INSTALL_DIR}/server.key\""
@@ -959,6 +937,7 @@ setup_kharej_clients() {
 
     echo ""
     echo "This Kharej server can be tunnelled to several Iran servers at the same time"
+    echo "Low-traffic mode: pool=1, aggressive_pool=false, keepalive=30s, retry=2s."
     echo "(one Backhaul client service is created per Iran server)."
     while true; do
         read -p "How many Iran servers should this Kharej server connect to? [1]: " count
@@ -1116,7 +1095,7 @@ install_flow() {
         optimize_system
     fi
 
-    if ask_yn "Install the watchdog (auto-restart on dead/idle tunnel)?" n; then
+    if ask_yn "Install the watchdog (restart only crashed/inactive tunnel)?" n; then
         setup_watchdog
     fi
 }
@@ -1127,13 +1106,13 @@ install_flow() {
 
 while true; do
     echo ""
-    echo "==== Backhaul Tunnel Manager (v8) ===="
+    echo "==== Backhaul Tunnel Manager (v9 Low-Traffic) ===="
     echo "1) Install / Setup tunnel (IPv4/IPv6, Kharej: multiple Iran servers)"
     echo "2) Show tunnel status"
     echo "3) Manage inbound ports (Iran side)"
     echo "4) Manage services (start/stop/restart/logs/edit)"
     echo "5) System optimizer (BBR + buffers + MTU + DNS + ulimits)"
-    echo "6) Install/repair Watchdog (auto-restart on dead/idle tunnel)"
+    echo "6) Install/repair Watchdog (restart only crashed/inactive tunnel)"
     echo "7) Uninstall tunnel"
     echo "8) Exit"
     read -p "Select an option [1-8]: " CHOICE
