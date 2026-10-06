@@ -1,21 +1,8 @@
 #!/bin/bash
 
 # =====================================================================================
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v10 (Optimized for Data & Resources)
+# Backhaul Tunnel Manager (Iran <-> Kharej) — v9
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding.
-#
-# v10 — OPTIMIZED FOR LOW DATA CONSUMPTION & RESOURCE EFFICIENCY:
-#   * Protocol tuning: `nodelay = false` (enables Nagle's algorithm to batch packets, reducing
-#     header overhead and saving significant bandwidth compared to `true`).
-#   * Reduced `channel_size` (16384 -> 4096) and `mux_con` (8 -> 4) to lower RAM usage.
-#   * Client `connection_pool` reduced (8 -> 2) and `aggressive_pool` disabled to prevent
-#     idle connection storms and unnecessary keepalive traffic.
-#   * Increased `keepalive_period` (20 -> 45) and `heartbeat` (15 -> 30) to reduce empty
-#     background packets. `retry_interval` increased (1 -> 5) to prevent reconnection spam.
-#   * Systemd limits capped: `LimitNOFILE=65536` and `TasksMax=4096` to prevent runaway resource usage.
-#   * Added Menu Option 8: "Anti-Bot Rate Limits" to apply iptables rate-limiting to tunnel ports,
-#     effectively blocking bot scanners that consume massive amounts of data by attacking open ports.
-#   * `RestartSec` increased to 5s to prevent CPU spikes during crash loops.
 #
 # v9 — ROOT-CAUSE FIX for "IPv6 tunnel connects, ping is good, but data is slow / pages load half":
 #   That symptom is a Path-MTU black hole: small packets (ping, handshake, heartbeats) pass, but
@@ -30,14 +17,43 @@
 #     - tcp_mtu_probing=1 as a safety net + ICMP "packet too big" explicitly allowed in
 #   Defaults: IPv6 MSS 1220 (= MTU 1280, the IPv6 minimum -> always safe), IPv4 MSS 1360 (= MTU 1400).
 #   Cost: < 1% throughput.  Menu 7 = detect the real path MTU / change MSS / diagnostics.
-#   !! Run v10 on BOTH servers. Each side only protects the data it RECEIVES, so updating
+#   !! Run v9 on BOTH servers. Each side only protects the data it RECEIVES, so updating
 #      one side fixes only one direction.
+#
+# v9 — stability / install fixes:
+#   * systemd: StartLimitIntervalSec was in [Service] (systemd ignores it there) -> a fast crash loop
+#     hit the default start limit and the unit stayed dead. Moved to [Unit]. Units now wait for
+#     network-online.target; OOMScoreAdjust -1000 -> -500 (-1000 can hang the whole VPS instead of
+#     killing the leaking process).
+#   * `set -e` removed (a failing systemctl/ping/openssl used to kill the whole menu); errors are
+#     handled explicitly, closed stdin no longer loops forever, Ctrl+C in live logs returns to the menu.
+#   * Re-running a setup now RESTARTS the service (v8 used `enable --now`, which kept the old config
+#     running). Service lists come from the unit files (disabled units used to vanish after a reboot).
+#   * Watchdog: exponential back-off (30s, 60s ... 600s) instead of restarting every 30s forever when
+#     the peer is down; respects "Stop" from the menu and disabled units; trims its own log.
+#   * Backhaul's server exits (Fatalf) if an inbound port can't be bound (tcp, ws/wss, wsmux/wssmux), and
+#     it re-binds all ports on every internal restart. v9 warns about ports already in use and reserves them
+#     (ip_local_reserved_ports) so outgoing connections can't grab them meanwhile.
+#   * Inbound port entries are validated (Backhaul splits targets on ':' -> IPv6 literal targets break).
+#   * Optimizer: removed keys that don't exist / are obsolete (tcp_user_timeout, tcp_low_latency),
+#     tcp_fastopen and ip_forward (not needed by a user-space tunnel); only keys the kernel really
+#     accepted are persisted (BBR only if available); tcp_retries2 6 -> 8; the MTU pin only ever LOWERS
+#     the MTU (v8 could raise a smaller NIC MTU to 1400 and break the link); DNS list follows what the
+#     host can reach (IPv6-only hosts had 5s lookups) and /etc/resolv.conf is backed up + restorable.
+#   * Install: missing packages (curl, openssl, iproute2, iptables, ping) are installed; download falls
+#     back to /releases/latest/download, a custom URL or a local .tar.gz; uninstall can revert tuning.
+#   * NOTE: Backhaul itself runs `sysctl -w` (tcp_tw_reuse=1, rmem/wmem_max up to 256MB, port range
+#     1024-65535, tcp_fastopen ...) at every start unless the config has skip_optz = true. It was
+#     left at its default; just be aware that it overrides same-named keys of the optimizer.
+#   * Token: still the fixed default "123" (as requested) — weak: the token is the ONLY authentication, so
+#     anyone who finds the tunnel port and guesses it can connect to your tunnel as a client. Override
+#     without editing the script:  BACKHAUL_TOKEN='long-random-string' bash script.sh  (same on all servers).
 #
 # Run this SEPARATELY on each server (every Iran server + the Kharej server).
 # Order: set up the Iran server(s) first, note their IP / tunnel port, then run the Kharej setup.
 # =====================================================================================
 
-VERSION="v10"
+VERSION="v9"
 REPO="Musixal/Backhaul"
 INSTALL_DIR="${BACKHAUL_DIR:-/root/backhaul-core}"
 SYSTEMD_DIR="${BACKHAUL_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -75,6 +91,7 @@ TUNNEL_PORT=""
 warn() { echo "Warning: $*"; }
 
 ask() {
+    # ask <var> <prompt> [default] — exits cleanly when stdin is closed (no endless prompt loops)
     local __v="$1" __p="$2" __d="${3:-}" __a=""
     if ! read -r -p "$__p" __a; then
         echo ""
@@ -86,6 +103,7 @@ ask() {
 }
 
 ask_yn() {
+    # usage: ask_yn "Question?" [y|n]   -> returns 0 for yes, 1 for no
     local prompt="$1" def="${2:-n}" ans
     ask ans "$prompt [$def]: " "$def"
     case "$ans" in
@@ -95,6 +113,7 @@ ask_yn() {
 }
 
 choose() {
+    # choose <var> <label> item...  -> sets <var> to the chosen item; returns 1 when cancelled (0)
     local __v="$1" __l="$2" __i __n __ans
     shift 2
     local -a __items=("$@")
@@ -116,6 +135,7 @@ choose() {
 }
 
 gen_port() {
+    # below the default ephemeral range (32768+) so outgoing connections are less likely to collide
     echo $(( (RANDOM % 22000) + 10000 ))
 }
 
@@ -147,6 +167,7 @@ valid_ipv6() {
 }
 
 clean_ip_input() {
+    # strip spaces and [ ] brackets the user may have typed around an IPv6 address
     local ip="$1"
     ip="${ip//[[:space:]]/}"
     ip="${ip//\[/}"
@@ -155,6 +176,7 @@ clean_ip_input() {
 }
 
 format_hostport() {
+    # IPv6 literals must be wrapped in [] when followed by :port
     local host="$1" port="$2"
     if [[ "$host" == *:* ]]; then
         echo "[${host}]:${port}"
@@ -164,10 +186,12 @@ format_hostport() {
 }
 
 make_tag() {
+    # filesystem/systemd-safe tag from an IP address
     echo "$1" | tr ':.' '__'
 }
 
 valid_port_entry() {
+    # Backhaul "ports" entries: 443 | 4000=5000 | 1000-1010 | 1000-1010:5201 | 443=1.1.1.1:5201 | 127.0.0.2:443=5201
     local e="$1" ip='([0-9]{1,3}\.){3}[0-9]{1,3}' p='[0-9]{1,5}' n
     [[ "$e" =~ ^(${ip}:)?${p}(-${p})?((=|:)(${ip}:)?${p})?$ ]] || return 1
     for n in $(echo "$e" | sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}//g' | grep -oE '[0-9]+'); do
@@ -177,6 +201,7 @@ valid_port_entry() {
 }
 
 entry_local_spec() {
+    # prints the LOCAL port / port range of a Backhaul "ports" entry (no bind-IP, no target)
     local e="$1" l
     l="${e%%=*}"
     if [[ "$l" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:(.+)$ ]]; then
@@ -192,6 +217,7 @@ has_global_ipv6() {
 }
 
 check_reachable() {
+    # quick TCP probe (works for IPv4 and IPv6 literals)
     local host="$1" port="$2"
     timeout 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
 }
@@ -208,10 +234,12 @@ detect_ping6() {
 }
 
 run_ping() {
+    # run_ping <host> <ping options...>   (picks the right IP version from the address)
     local host="$1"
     shift
     if [[ "$host" == *:* ]]; then
         detect_ping6
+        # shellcheck disable=SC2086
         $PING6_CMD "$@" "$host"
     else
         ping -4 "$@" "$host"
@@ -219,6 +247,7 @@ run_ping() {
 }
 
 ping_ok() {
+    # plain reachability: ping_ok <host> [count] [timeout]
     run_ping "$1" -n -c "${2:-1}" -W "${3:-2}" >/dev/null 2>&1
 }
 
@@ -233,6 +262,7 @@ detect_public_ip() {
             return 0
         fi
     done
+    # fallback: source address of the default IPv4 route
     ip route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -n1
 }
 
@@ -281,6 +311,7 @@ pkg_for_cmd() {
 }
 
 ensure_cmds() {
+    # ensure_cmds cmd...  — installs whatever is missing (best effort). Returns 1 if something is still missing.
     local c p rc=0
     local -a pkgs=()
     for c in "$@"; do
@@ -336,6 +367,7 @@ ensure_backhaul_local() {
         url=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
             | grep "browser_download_url" | grep "linux_${asset_arch}" | grep -v "\.sha256" \
             | head -n1 | cut -d '"' -f4)
+        # API rate-limited / blocked? the "latest/download" redirect needs no API call.
         [ -z "$url" ] && url="https://github.com/${REPO}/releases/latest/download/backhaul_linux_${asset_arch}.tar.gz"
     fi
 
@@ -382,6 +414,7 @@ ensure_backhaul_local() {
 }
 
 ensure_tls_cert_local() {
+    # wss/wssmux require tls_cert/tls_key on the server side.
     if [ -s "$INSTALL_DIR/server.crt" ] && [ -s "$INSTALL_DIR/server.key" ]; then
         return 0
     fi
@@ -403,6 +436,7 @@ ensure_tls_cert_local() {
 # ============================================================
 
 list_backhaul_units() {
+    # from the unit FILES (units that are disabled + not loaded would not show up in `systemctl list-units`)
     local f
     for f in "$SYSTEMD_DIR"/backhaul-*.service; do
         [ -e "$f" ] && basename "$f"
@@ -410,16 +444,19 @@ list_backhaul_units() {
 }
 
 list_tunnel_units() {
+    # tunnel services only (no MTU / MSS / watchdog helper units)
     list_backhaul_units | grep -vE '^backhaul-(mtu|mss|watchdog)\.service$' || true
 }
 
 unit_toml() {
+    # prints the .toml path a backhaul unit was started with
     local f="$SYSTEMD_DIR/$1"
     [ -f "$f" ] || return 0
     sed -n 's/^ExecStart=.*[[:space:]]-c[[:space:]]\{1,\}\([^[:space:]]\{1,\}\.toml\).*$/\1/p' "$f" | head -n1
 }
 
 toml_str() {
+    # toml_str <file> <key>  -> string value
     grep -E "^$2[[:space:]]*=" "$1" 2>/dev/null | head -n1 | cut -d'"' -f2
 }
 
@@ -434,6 +471,7 @@ toml_family() {
 }
 
 unit_conn_count() {
+    # number of established tunnel connections that belong to this unit
     local unit="$1" toml port pid
     toml=$(unit_toml "$unit")
     if [ -z "$toml" ] || [ ! -f "$toml" ]; then echo 0; return 0; fi
@@ -452,10 +490,12 @@ unit_conn_count() {
 # ---------- ports ----------
 
 port_owner() {
+    # name of the process listening on a TCP port (empty if free / unknown)
     ss -H -ltnp "( sport = :$1 )" 2>/dev/null | grep -oE 'users:\(\("[^"]+"' | head -n1 | sed 's/users:(("//; s/"$//'
 }
 
 ports_conflict_ok() {
+    # ports_conflict_ok spec... — warns about ports already used by OTHER programs. 0 = ok / confirmed.
     local spec owner bad=0
     for spec in "$@"; do
         [[ "$spec" =~ ^[0-9]+$ ]] || continue
@@ -495,6 +535,7 @@ collect_reserved_ports() {
 }
 
 update_reserved_ports() {
+    # keep tunnel + inbound ports out of the ephemeral pool (Backhaul also widens the pool to 1024-65535)
     local ours cur merged conf="${SYSCTL_DIR}/96-backhaul-reserved.conf"
     ours=$(collect_reserved_ports)
     if [ -z "$ours" ]; then
@@ -509,14 +550,16 @@ update_reserved_ports() {
 }
 
 prepare_ipv6() {
+    # Make sure IPv6 is enabled in the kernel and listeners are dual-stack.
+    # Returns 1 if the user wants to go back (no global IPv6 on this host).
     local conf="${SYSCTL_DIR}/98-backhaul-ipv6.conf"
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
     sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1
     cat > "$conf" << EOF
-net.ipv6.conf.all.disable_ipv6=0
-net.ipv6.conf.default.disable_ipv6=0
-net.ipv6.bindv6only=0
+-net.ipv6.conf.all.disable_ipv6=0
+-net.ipv6.conf.default.disable_ipv6=0
+-net.ipv6.bindv6only=0
 EOF
     if has_global_ipv6; then
         return 0
@@ -530,6 +573,7 @@ EOF
 }
 
 ask_ip_version() {
+    # sets global IP_MODE to 4 or 6
     local prompt="$1" c
     echo ""
     echo "$prompt"
@@ -549,6 +593,7 @@ ask_ip_version() {
 mss_load_env() {
     MSS_V6=$DEFAULT_MSS_V6
     MSS_V4=$DEFAULT_MSS_V4
+    # shellcheck disable=SC1090
     [ -f "$MSS_ENV" ] && . "$MSS_ENV"
 }
 
@@ -561,6 +606,7 @@ EOF
 }
 
 mss_from_mtu() {
+    # mss_from_mtu <path-mtu> <4|6> -> MSS to use (MTU capped at MTU_CAP, IPv6 never below MTU 1280)
     local mtu="$1" fam="$2"
     [ "$mtu" -gt "$MTU_CAP" ] && mtu=$MTU_CAP
     if [ "$fam" = "6" ]; then
@@ -572,10 +618,13 @@ mss_from_mtu() {
 }
 
 pingdf() {
+    # one "don't fragment" probe with <payload> bytes of ICMP data; 0 = at least one reply
     run_ping "$1" -n -c 3 -i 0.3 -W 2 -M 'do' -s "$2" >/dev/null 2>&1
 }
 
 probe_pmtu() {
+    # probe_pmtu <host> -> prints the path MTU (IP packet size that still gets an echo reply, both
+    # directions). Prints nothing and returns 1 when it cannot be measured (ICMP echo blocked).
     local host="$1" hdr lo hi mid best l h dev
     if [[ "$host" == *:* ]]; then hdr=48; lo=1280; else hdr=28; lo=1200; fi
     hi=1500
@@ -704,7 +753,7 @@ apply() {
             echo "IPv$fam: netfilter mangle table not usable here — skipped."
             continue
         fi
-        if [ "$fam" = "6" ]; then mss=$MSS_V6; else mss=$MSS_V4; fi
+        if [ "$fam" = 6 ]; then mss=$MSS_V6; else mss=$MSS_V4; fi
 
         ipt "$fam" -t mangle -N "$CHAIN" 2>/dev/null
         if ! ipt "$fam" -t mangle -F "$CHAIN"; then
@@ -728,7 +777,7 @@ apply() {
         # make sure the ICMP errors that normal PMTU discovery needs are never dropped locally
         ipt "$fam" -N "$ICMP_CHAIN" 2>/dev/null
         ipt "$fam" -F "$ICMP_CHAIN" 2>/dev/null
-        if [ "$fam" = "6" ]; then
+        if [ "$fam" = 6 ]; then
             ipt 6 -A "$ICMP_CHAIN" -p icmpv6 --icmpv6-type packet-too-big -j ACCEPT 2>/dev/null
         else
             ipt 4 -A "$ICMP_CHAIN" -p icmp --icmp-type fragmentation-needed -j ACCEPT 2>/dev/null
@@ -781,6 +830,7 @@ EOF
 }
 
 mss_refresh() {
+    # re-apply the rules after a toml/port change (no-op if MSS protection was never installed)
     [ -f "$MSS_SCRIPT" ] && bash "$MSS_SCRIPT" apply >/dev/null 2>&1
     return 0
 }
@@ -791,6 +841,7 @@ mss_active() {
 }
 
 sync_toml_mss() {
+    # keep the native `mss =` line of tcp/tcpmux configs in step with mss.env. Returns 0 if any file changed.
     local toml tr fam val changed=1
     mss_load_env
     for toml in "$INSTALL_DIR"/*.toml; do
@@ -810,6 +861,7 @@ sync_toml_mss() {
 }
 
 setup_mss_protection() {
+    # uses the MSS_V6 / MSS_V4 currently in memory (callers load or change them first)
     ensure_cmds iptables ip6tables >/dev/null 2>&1
     write_mss_script
     write_mss_unit
@@ -831,6 +883,8 @@ setup_mss_protection() {
 }
 
 peer_list() {
+    # peer_list -> prints the other end(s): Kharej = the Iran servers from the client configs;
+    # otherwise asks for an address.
     local u toml peer p
     local -a peers=()
     for u in $(list_tunnel_units); do
@@ -1039,6 +1093,7 @@ ensure_dns() {
     local n ok4=0 ok6=0
     local -a lines=()
     mkdir -p "$INSTALL_DIR"
+    # only use the IP families this host can actually reach (a dead first nameserver = 5s per lookup)
     for n in 1.1.1.1 1.0.0.1 8.8.8.8; do
         if ping_ok "$n" 1 2; then ok4=1; break; fi
     done
@@ -1053,6 +1108,7 @@ ensure_dns() {
     [ "$ok6" = 1 ] && lines+=("nameserver 2606:4700:4700::1111" "nameserver 2001:4860:4860::8888")
 
     chattr -i "$RESOLV_CONF" 2>/dev/null
+    # back up the original once, so uninstall can restore it
     if [ ! -f "$INSTALL_DIR/resolv.conf.orig" ] && [ ! -f "$INSTALL_DIR/resolv.conf.link" ]; then
         if [ -L "$RESOLV_CONF" ]; then
             readlink "$RESOLV_CONF" > "$INSTALL_DIR/resolv.conf.link"
@@ -1061,12 +1117,14 @@ ensure_dns() {
         fi
     fi
     if [ -L "$RESOLV_CONF" ]; then
+        # usually systemd-resolved's stub: replace the symlink with a static file so it isn't reset
         rm -f "$RESOLV_CONF"
     fi
     {
         printf '%s\n' "${lines[@]}"
         echo "options timeout:2 attempts:2"
     } > "$RESOLV_CONF"
+    # Best-effort: stop NetworkManager / dhcp clients from overwriting it back.
     chattr +i "$RESOLV_CONF" 2>/dev/null
     echo "DNS set (${lines[*]//nameserver /}). ${RESOLV_CONF} is now static/locked (chattr +i); uninstall can restore it."
 }
@@ -1090,7 +1148,7 @@ root hard nofile 1048576
 EOF
     fi
     ulimit -n 1048576 2>/dev/null
-    echo "File descriptor limits raised (the services also get LimitNOFILE=65536 from systemd)."
+    echo "File descriptor limits raised (the services also get LimitNOFILE=1048576 from systemd)."
 }
 
 optimize_system() {
@@ -1123,6 +1181,7 @@ optimize_system() {
     echo "Interface: $(detect_default_iface)"
     modprobe tcp_bbr >/dev/null 2>&1
 
+    # keep fs.file-max if ensure_ulimits wrote it earlier; rebuild the rest from what the kernel accepts
     tmp=$(mktemp)
     grep "^fs.file-max" "$conf" 2>/dev/null > "$tmp"
     {
@@ -1187,6 +1246,16 @@ setup_watchdog() {
     cat > "$WATCHDOG_SCRIPT" << 'WDEOF'
 #!/bin/bash
 # Backhaul watchdog — runs every 10s via backhaul-watchdog.timer
+# Restarts a tunnel service when
+#   1) it is not active, or
+#   2) it is active but has had ZERO established tunnel connections for longer than the idle threshold.
+# Restarts back off exponentially (30s, 60s, 120s ... max 600s) so a peer that is down does not turn into
+# a restart storm; the counter resets as soon as a connection is seen again.
+# Skipped: units that are disabled, and units stopped from the manager menu ("paused").
+#
+# Works with IPv4 and IPv6 tunnels and with several tunnel services on one machine: each service is
+# judged only by the connections that belong to its own process.
+
 INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$INSTALL_DIR/watchdog-state"
 LOG_FILE="$INSTALL_DIR/watchdog.log"
@@ -1196,6 +1265,7 @@ MAX_IDLE=600
 
 mkdir -p "$STATE_DIR"
 
+# keep the log small
 if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
     tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
@@ -1212,7 +1282,7 @@ for unit_file in "$SYSTEMD_DIR"/backhaul-*.service; do
     systemctl is-enabled --quiet "$unit" 2>/dev/null || continue
 
     now=$(date +%s)
-    state_file="$STATE_DIR/${unit}.state"
+    state_file="$STATE_DIR/${unit}.state"      # "<last_ok_epoch> <consecutive_restarts>"
     last_ok=""
     fails=""
     [ -f "$state_file" ] && read -r last_ok fails < "$state_file"
@@ -1230,14 +1300,18 @@ for unit_file in "$SYSTEMD_DIR"/backhaul-*.service; do
     toml=$(sed -n 's/^ExecStart=.*[[:space:]]-c[[:space:]]\{1,\}\([^[:space:]]\{1,\}\.toml\).*$/\1/p' "$unit_file" | head -n1)
     { [ -z "$toml" ] || [ ! -f "$toml" ]; } && continue
 
+    # Tunnel port = last number of bind_addr (server) or remote_addr (client).
+    # Handles "0.0.0.0:443", "[::]:443", "1.2.3.4:443" and "[2001:db8::1]:443".
     port=$(grep -E '^(bind_addr|remote_addr)[[:space:]]*=' "$toml" | head -n1 | grep -oE '[0-9]+"$' | tr -d '"')
     [ -z "$port" ] && continue
     pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null)
     { [ -z "$pid" ] || [ "$pid" = "0" ]; } && continue
 
     if grep -q '^\[server\]' "$toml" 2>/dev/null; then
+        # Iran side: connections accepted on the tunnel port
         active_conns=$(ss -H -tn state established "( sport = :${port} )" 2>/dev/null | grep -c .)
     else
+        # Kharej side: connections of THIS service's process to the tunnel port
         active_conns=$(ss -H -tnp state established "( dport = :${port} )" 2>/dev/null | grep -c "pid=${pid},")
     fi
 
@@ -1288,48 +1362,6 @@ EOF
     systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
     echo "Watchdog installed — checks every 10s; restarts a tunnel after ${WATCHDOG_IDLE_THRESHOLD}s without connections (then 60s, 120s ... up to 10 min)."
     echo "Log: $WATCHDOG_LOG"
-}
-
-# ============================================================
-# Anti-Bot Rate Limiting
-# ============================================================
-
-apply_antibot_rules() {
-    local port fam
-    echo ""
-    echo "=== Anti-Bot / Rate Limiting ==="
-    echo "This will limit NEW connections to your tunnel ports to prevent bot scanners from consuming your data."
-    if ! ask_yn "Apply rate limits to all active Backhaul tunnel ports?" y; then return; fi
-
-    ensure_cmds iptables ip6tables >/dev/null 2>&1
-    
-    local applied=0
-    for toml in "$INSTALL_DIR"/*.toml; do
-        [ -f "$toml" ] || continue
-        grep -q '^\[server\]' "$toml" || continue
-        addr=$(toml_str "$toml" bind_addr)
-        port=${addr##*:}
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-        
-        fam=$(toml_family "$toml")
-        if [ "$fam" = "6" ] && command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -m limit --limit 10/min --limit-burst 20 -j ACCEPT 2>/dev/null || \
-            { ip6tables -I INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -m limit --limit 10/min --limit-burst 20 -j ACCEPT 2>/dev/null && \
-              ip6tables -I INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -j DROP 2>/dev/null && applied=1; }
-            echo "IPv6 rate-limit applied for port $port."
-        elif command -v iptables >/dev/null 2>&1; then
-            iptables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -m limit --limit 10/min --limit-burst 20 -j ACCEPT 2>/dev/null || \
-            { iptables -I INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -m limit --limit 10/min --limit-burst 20 -j ACCEPT 2>/dev/null && \
-              iptables -I INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -j DROP 2>/dev/null && applied=1; }
-            echo "IPv4 rate-limit applied for port $port."
-        fi
-    done
-    if [ "$applied" = "1" ]; then
-        echo "Done. Bot scanners will now be dropped if they exceed 10 new connections per minute."
-        echo "Note: These rules are not persistent across reboots unless you save them (e.g., apt install iptables-persistent)."
-    else
-        echo "No server configs found or iptables failed."
-    fi
 }
 
 # ============================================================
@@ -1477,6 +1509,7 @@ manage_ports() {
         return
     fi
 
+    # Rebuild only the ports = [ ... ] block; everything else in the file is preserved.
     line_no=$(grep -n '^ports = \[' "$TOML_FILE" | head -n1 | cut -d: -f1)
     if [ -z "$line_no" ]; then
         echo "Could not find the 'ports = [' block in $TOML_FILE — nothing changed."
@@ -1647,9 +1680,9 @@ Type=simple
 User=root
 ExecStart=${INSTALL_DIR}/backhaul -c $3
 Restart=always
-RestartSec=5
-LimitNOFILE=65536
-TasksMax=4096
+RestartSec=2
+LimitNOFILE=1048576
+TasksMax=infinity
 LimitMEMLOCK=infinity
 OOMScoreAdjust=-500
 StandardOutput=journal
@@ -1670,12 +1703,12 @@ write_server_toml() {
         echo "bind_addr = \"${bind}\""
         echo "transport = \"${TRANSPORT}\""
         echo "token = \"${TOKEN}\""
-        echo "keepalive_period = 45"
-        echo "nodelay = false"
-        echo "channel_size = 4096"
-        echo "heartbeat = 30"
+        echo "keepalive_period = 20"
+        echo "nodelay = true"
+        echo "channel_size = 16384"
+        echo "heartbeat = 15"
         case "$TRANSPORT" in
-            tcpmux|wsmux|wssmux) echo "mux_con = 4" ;;
+            tcpmux|wsmux|wssmux) echo "mux_con = 8" ;;
         esac
         case "$TRANSPORT" in
             tcp|tcpmux) echo "mss = ${mss}" ;;
@@ -1711,12 +1744,12 @@ write_client_toml() {
         echo "remote_addr = \"${remote}\""
         echo "transport = \"${TRANSPORT}\""
         echo "token = \"${TOKEN}\""
-        echo "connection_pool = 2"
-        echo "aggressive_pool = false"
-        echo "keepalive_period = 45"
-        echo "nodelay = false"
-        echo "retry_interval = 5"
-        echo "dial_timeout = 15"
+        echo "connection_pool = 8"
+        echo "aggressive_pool = true"
+        echo "keepalive_period = 20"
+        echo "nodelay = true"
+        echo "retry_interval = 1"
+        echo "dial_timeout = 10"
         case "$TRANSPORT" in
             tcp|tcpmux) echo "mss = ${mss}" ;;
         esac
@@ -1734,6 +1767,7 @@ setup_iran_server() {
     local bind_addr guess public_ip default_port port p spec mss unit
     local -a PORT_ARRAY=() BAD=() SPECS=()
 
+    # --- IP version of the tunnel listener ---
     while true; do
         echo ""
         echo "(IPv4 listens on 0.0.0.0:PORT. IPv6 listens on [::]:PORT, which normally accepts"
@@ -1766,6 +1800,7 @@ setup_iran_server() {
         fi
     done
 
+    # --- Tunnel port ---
     default_port=$(gen_port)
     while true; do
         ask TUNNEL_PORT "Tunnel port [${default_port}]: " "$default_port"
@@ -1773,6 +1808,7 @@ setup_iran_server() {
             echo "Invalid port (1-65535)."
             continue
         fi
+        # a previous run of this same tunnel must not count as "in use"
         unit="backhaul-iran${TUNNEL_PORT}.service"
         if [ -f "$SYSTEMD_DIR/$unit" ]; then
             systemctl stop "$unit" >/dev/null 2>&1
@@ -1780,6 +1816,7 @@ setup_iran_server() {
         ports_conflict_ok "$TUNNEL_PORT" && break
     done
 
+    # --- Inbound (user-facing) ports ---
     while true; do
         ask INBOUND_PORTS "Inbound ports on this Iran server (comma separated, e.g. 2050,2023 or 443=8443 or 1000-1010): "
         INBOUND_PORTS="${INBOUND_PORTS// /}"
@@ -1889,6 +1926,7 @@ setup_kharej_clients() {
                 continue
             fi
 
+            # address (must match the chosen IP version)
             while true; do
                 ask ip "Iran server #${i} public IPv${IP_MODE} address: "
                 ip=$(clean_ip_input "$ip")
@@ -1901,6 +1939,7 @@ setup_kharej_clients() {
                 fi
             done
 
+            # tunnel port of THAT Iran server (default: the previous server's port)
             while true; do
                 ask port "Tunnel port of Iran server #${i} [${prev_port}]: " "$prev_port"
                 if valid_port "$port"; then break; fi
@@ -1932,6 +1971,7 @@ setup_kharej_clients() {
         prev_port="$port"
     done
 
+    # --- create one client service per Iran server ---
     for k in "${!IPS[@]}"; do
         ip="${IPS[k]}"
         port="${PORTS[k]}"
@@ -1948,6 +1988,7 @@ setup_kharej_clients() {
     done
     systemctl daemon-reload
 
+    # the clamp must be in place BEFORE the first tunnel connection is made
     [ "$MSS_ENABLE" = "1" ] && setup_mss_protection
 
     for k in "${!SVCS[@]}"; do
@@ -2004,7 +2045,7 @@ install_flow() {
 
     echo ""
     echo "Choose transport (must be the SAME on the Iran server(s) and the Kharej server):"
-    echo "  1) wss     - TLS encrypted, looks like HTTPS to firewalls (recommended for low overhead)"
+    echo "  1) wss     - TLS encrypted, looks like HTTPS to firewalls (recommended)"
     echo "  2) wssmux  - wss + multiplexing, best for many concurrent connections / high throughput"
     echo "  3) tcp     - plain TCP, fastest but not encrypted or disguised"
     echo "  4) tcpmux  - tcp + multiplexing"
@@ -2016,6 +2057,7 @@ install_flow() {
         *) TRANSPORT="wss" ;;
     esac
 
+    # Token is fixed by default (same on every server, no prompt). Override: BACKHAUL_TOKEN=... bash script.sh
     TOKEN="$FIXED_TOKEN"
     if ! [[ "$TOKEN" =~ ^[A-Za-z0-9._~+=-]+$ ]]; then
         echo "BACKHAUL_TOKEN may only contain letters, digits and . _ ~ + = -"
@@ -2086,10 +2128,9 @@ main() {
         echo "5) System optimizer (BBR + buffers + MTU cap + DNS + ulimits)"
         echo "6) Install/repair Watchdog (auto-restart on dead/idle tunnel)"
         echo "7) MTU / MSS fix + IPv6 diagnostics  (use when ping is fine but data stalls)"
-        echo "8) Apply Anti-Bot Rate Limits (Stop bot scanners from eating your data)"
-        echo "9) Uninstall tunnel"
-        echo "10) Exit"
-        ask CHOICE "Select an option [1-10]: "
+        echo "8) Uninstall tunnel"
+        echo "9) Exit"
+        ask CHOICE "Select an option [1-9]: "
         case "$CHOICE" in
             1) install_flow ;;
             2) show_status ;;
@@ -2098,9 +2139,8 @@ main() {
             5) optimize_system ;;
             6) setup_watchdog ;;
             7) mtu_menu ;;
-            8) apply_antibot_rules ;;
-            9) uninstall_all ;;
-            10) exit 0 ;;
+            8) uninstall_all ;;
+            9) exit 0 ;;
             *) echo "Invalid option." ;;
         esac
     done
