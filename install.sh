@@ -425,19 +425,22 @@ setup_watchdog() {
 
     cat > "$WATCHDOG_SCRIPT" << 'WDEOF'
 #!/bin/bash
-# Backhaul watchdog — low-data mode.
-# IMPORTANT: This watchdog NEVER restarts a healthy tunnel just because
-# there are zero established user connections. Idle time alone is NOT treated
-# as a tunnel failure, so it cannot create repeated reconnect/handshake traffic.
+# Backhaul watchdog — runs every 10s via backhaul-watchdog.timer
+# Restarts a service if:
+#   1) it is not active, OR
+#   2) it has been active but with zero established tunnel connections for
+#      IDLE_THRESHOLD seconds (link looks dead/hung).
 #
-# It only restarts a tunnel service when systemd reports that the service is
-# inactive. The tunnel service itself already has Restart=always, so normal
-# crash recovery remains handled by systemd.
+# Works with IPv4 and IPv6 tunnels, and with several tunnel services on one machine
+# (e.g. a Kharej server connected to multiple Iran servers): each service is judged
+# only by the connections that belong to its own process.
 
 INSTALL_DIR="/root/backhaul-core"
+STATE_DIR="$INSTALL_DIR/watchdog-state"
 LOG_FILE="$INSTALL_DIR/watchdog.log"
+IDLE_THRESHOLD=30
 
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$STATE_DIR"
 
 for unit in $(systemctl list-units --all --plain --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}'); do
     case "$unit" in
@@ -445,8 +448,45 @@ for unit in $(systemctl list-units --all --plain --no-legend 'backhaul-*.service
     esac
 
     if ! systemctl is-active --quiet "$unit"; then
-        systemctl restart "$unit" 2>/dev/null || true
+        systemctl restart "$unit" 2>/dev/null
         echo "$(date '+%F %T') restarted $unit (service was inactive)" >> "$LOG_FILE"
+        rm -f "${STATE_DIR}/${unit}.last_ok"
+        continue
+    fi
+
+    unit_file="/etc/systemd/system/${unit}"
+    toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "$unit_file" 2>/dev/null | head -n1)
+    [ -z "$toml" ] || [ ! -f "$toml" ] && continue
+
+    # Tunnel port = last number of bind_addr (server) or remote_addr (client).
+    # Handles "0.0.0.0:443", "[::]:443", "1.2.3.4:443" and "[2001:db8::1]:443".
+    port=$(grep -E '^(bind_addr|remote_addr)[[:space:]]*=' "$toml" | head -n1 | grep -oE '[0-9]+"$' | tr -d '"')
+    [ -z "$port" ] && continue
+
+    pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null)
+    [ -z "$pid" ] || [ "$pid" = "0" ] && continue
+
+    if grep -q '^\[server\]' "$toml" 2>/dev/null; then
+        # Iran side: connections accepted on the tunnel port
+        active_conns=$(ss -H -tn state established "( sport = :${port} )" 2>/dev/null | grep -c .)
+    else
+        # Kharej side: connections of THIS service's process to the tunnel port
+        active_conns=$(ss -H -tnp state established "( dport = :${port} )" 2>/dev/null | grep -c "pid=${pid},")
+    fi
+
+    now=$(date +%s)
+    state_file="${STATE_DIR}/${unit}.last_ok"
+
+    if [ "${active_conns:-0}" -gt 0 ]; then
+        echo "$now" > "$state_file"
+    else
+        last_ok=$(cat "$state_file" 2>/dev/null || echo "$now")
+        idle=$(( now - last_ok ))
+        if [ "$idle" -ge "$IDLE_THRESHOLD" ]; then
+            systemctl restart "$unit" 2>/dev/null
+            echo "$now" > "$state_file"
+            echo "$(date '+%F %T') restarted $unit (idle ${idle}s, no established connections on port ${port})" >> "$LOG_FILE"
+        fi
     fi
 done
 WDEOF
@@ -454,7 +494,7 @@ WDEOF
 
     cat > /etc/systemd/system/backhaul-watchdog.service << EOF
 [Unit]
-Description=Backhaul Watchdog (inactive-service recovery only)
+Description=Backhaul Watchdog (health check / auto-restart)
 
 [Service]
 Type=oneshot
@@ -463,12 +503,12 @@ EOF
 
     cat > /etc/systemd/system/backhaul-watchdog.timer << 'EOF'
 [Unit]
-Description=Run Backhaul Watchdog every 30 seconds
+Description=Run Backhaul Watchdog every 10 seconds
 
 [Timer]
-OnBootSec=30
-OnUnitActiveSec=30
-AccuracySec=5
+OnBootSec=20
+OnUnitActiveSec=10
+AccuracySec=1
 Unit=backhaul-watchdog.service
 
 [Install]
@@ -477,7 +517,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
-    echo "Low-data watchdog installed — no restart based on idle connections."
+    echo "Watchdog installed — checks every 10s, restarts a tunnel after ${WATCHDOG_IDLE_THRESHOLD}s with no active connections."
     echo "Log: $WATCHDOG_LOG"
 }
 
@@ -1076,7 +1116,7 @@ install_flow() {
         optimize_system
     fi
 
-    if ask_yn "Install the low-data watchdog (restart only if service is inactive)?" n; then
+    if ask_yn "Install the watchdog (auto-restart on dead/idle tunnel)?" n; then
         setup_watchdog
     fi
 }
@@ -1093,7 +1133,7 @@ while true; do
     echo "3) Manage inbound ports (Iran side)"
     echo "4) Manage services (start/stop/restart/logs/edit)"
     echo "5) System optimizer (BBR + buffers + MTU + DNS + ulimits)"
-    echo "6) Install/repair Watchdog (low-data; restart only if service is inactive)"
+    echo "6) Install/repair Watchdog (auto-restart on dead/idle tunnel)"
     echo "7) Uninstall tunnel"
     echo "8) Exit"
     read -p "Select an option [1-8]: " CHOICE
