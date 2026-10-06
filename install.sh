@@ -1,55 +1,40 @@
 #!/bin/bash
 
 # =====================================================================================
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v12
+# Backhaul Tunnel Manager (Iran <-> Kharej) — v13
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding.
 #
-# v12 — binary update + IPv6 / port-forward / MSS fixes
-#   * Menu 11: update the Backhaul binary to the latest OFFICIAL release (Musixal/Backhaul). Shows installed vs
-#     latest, keeps a backup (backhaul.bak), restarts the tunnels, rolls back automatically if the new binary
-#     does not come up. Do it on BOTH servers (same version on both sides).
-#   * Menu 12: IPv6 check + repair (also runs automatically at the end of an IPv6 install): IPv6 sysctls,
-#     stable source address (use_tempaddr=0 — a rotating "temporary" address is a classic reason why an IPv6
-#     tunnel works for a day and then "does not connect"), default route, listener on [::], firewall chain,
-#     TCP probe to the Iran server, MSS re-measure.
-#   * Iran setup now proposes a STABLE global IPv6 address (never a temporary/deprecated one) as the address
-#     you give to the Kharej side, and lists all stable addresses of the server.
-#   * MSS: the clamp now also covers the user-facing INBOUND ports on the Iran side (SYN-ACK of connections from
-#     your users — an IPv6 path-MTU black hole between users and Iran looked like a "tunnel problem"). Toggle:
-#     menu 7 -> 10. The path MTU is measured against the real peer (on Iran the Kharej address is taken from the
-#     established tunnel connections — no typing).
-#   * Menu 13: port-forward check — which family each inbound port listens on, local IPv4/IPv6 connect test,
-#     and (Kharej) whether the backend target answers on 127.0.0.1 / ::1.
-#
-# v11 — fixes found while testing v10 on a real Iran <-> Kharej pair
-#   * Kharej setup no longer leaves a dead client behind. If you set up the same Iran server again on
-#     a NEW tunnel port (e.g. 2124 -> 2060), the old client service (the one that kept logging
-#     "dial tcp ...:2124: i/o timeout" forever) is detected and you are offered to remove it.
-#   * The token is no longer silently fixed. At install you choose: Enter = default, type your own,
-#     or "r" = generate a strong random token (shown at the end — copy it to the other server).
-#   * New main-menu option 10: change the token on THIS server in all tunnel configs + restart.
-#   * Status shows the Backhaul binary version (compare it on both servers — a version mismatch is a
-#     possible cause of "invalid signal received for channel") and explains that log line:
-#     a single occurrence = stray connection / scanner on the tunnel port (harmless); repeating every
-#     few seconds = token / transport / version mismatch.
-#   * Deleting a service (menu 4 -> 10) and the stale-client cleanup share one helper.
-#   Everything from v10 is kept (firewall auto-open, TCP probe, SYN watch, MSS clamp, watchdog).
-#
-# v10 — "ping works but the Kharej client never connects" ('i/o timeout' = the SYN gets no answer):
-#   Iran setup opens the tunnel + inbound ports (ufw / firewalld / iptables+ip6tables chain
-#   BACKHAUL_FW, re-applied at boot by backhaul-mss.service); Kharej setup / status probe the TCP port
-#   and print a verdict; menu 7 has 6) TCP test  7) listener + firewall check  8) watch incoming SYN
-#   9) open the firewall now. Port changes refresh the firewall rules.
-# v9  — path-MTU black-hole fix (ping ok but data stalls): TCP MSS clamp, tcp_mtu_probing, ICMP
-#   packet-too-big allowed. IPv6 MSS 1220, IPv4 MSS 1360. Run on BOTH servers.
+# v13 — cleanup + install fixes
+#   * REMOVED menu options (and their code):
+#       - System optimizer (BBR / buffers / MTU cap / DNS / ulimits)
+#       - Connection tools menu ('i/o timeout' diagnosis, MTU/MSS submenu)
+#       - Binary updater (menu 11)
+#       - Port-forward check (menu 13)
+#     The remaining menu is renumbered 1-9. Uninstall no longer asks about
+#     reverting "system tuning" (there is none anymore).
+#   * Kharej install: the automatic TCP probe (and its ping diagnostics) before
+#     adding an Iran server is disabled — the client service is created directly
+#     and retries by itself. The post-install wait no longer probes either.
+#   * IPv6 fixes (server AND client side):
+#       - use_tempaddr=0 (stable source address) is now applied to EVERY
+#         interface that carries a global IPv6 address, not only the default
+#         route interface, and is persisted for all of them.
+#       - The Iran setup lists ALL stable global IPv6 addresses of the server
+#         (never temporary/deprecated ones) for the Kharej side.
+#       - IPv6 check + repair (menu 9) still runs automatically after an IPv6
+#         install on both roles.
+#   * Text references to the deleted menus now point to menu 9 (IPv6 check +
+#     repair) or menu 8 (token change).
 #
 # Run this SEPARATELY on each server (every Iran server + the Kharej server).
-# Order: set up the Iran server(s) first, note their IP / tunnel port / token, then run the Kharej setup.
-# Token: the SAME value on every server. Default "123" is weak (it is the only authentication).
-#   Pick your own or "r" (random) at the prompt, or:  BACKHAUL_TOKEN='long-random-string' bash script.sh
+# Order: set up the Iran server(s) first, note their IP / tunnel port / token,
+# then run the Kharej setup.
+# Token: the SAME value on every server. Default "123" is weak (it is the only
+# authentication). Pick your own or "r" (random) at the prompt, or:
+#   BACKHAUL_TOKEN='long-random-string' bash script.sh
 # =====================================================================================
 
-VERSION="v12"
+VERSION="v13"
 REPO="Musixal/Backhaul"
 INSTALL_DIR="${BACKHAUL_DIR:-/root/backhaul-core}"
 SYSTEMD_DIR="${BACKHAUL_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -625,8 +610,9 @@ update_reserved_ports() {
 }
 
 ipv6_sysctls() {
-    # IPv6 enabled, dual-stack listeners, and a STABLE outgoing source address (no temporary addresses).
-    local conf="${SYSCTL_DIR}/98-backhaul-ipv6.conf" iface
+    # IPv6 enabled, dual-stack listeners, and a STABLE outgoing source address (no temporary
+    # addresses) — on the default interface AND on every interface that has a global address.
+    local conf="${SYSCTL_DIR}/98-backhaul-ipv6.conf" iface ifc
     iface=$(detect_default_iface)
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
@@ -642,6 +628,13 @@ ipv6_sysctls() {
 -net.ipv6.conf.default.use_tempaddr=0
 -net.ipv6.conf.${iface}.use_tempaddr=0
 EOF
+    # every other interface that carries a global IPv6 address: pin its source address too
+    for ifc in $(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2}' | cut -d@ -f1); do
+        if ip -6 addr show dev "$ifc" scope global 2>/dev/null | grep -q "inet6"; then
+            sysctl -w "net.ipv6.conf.${ifc}.use_tempaddr=0" >/dev/null 2>&1
+            echo "net.ipv6.conf.${ifc}.use_tempaddr=0" >> "$conf"
+        fi
+    done
 }
 
 prepare_ipv6() {
@@ -720,7 +713,7 @@ diagnose_connect() {
             ;;
         REFUSED)
             echo "  => The host answered with a reset: it is reachable, but NOTHING LISTENS on port ${port}"
-            echo "     for IPv${fam}. On the Iran server: menu 7 -> 7 (is the service running / listening on [::]?"
+            echo "     for IPv${fam}. On the Iran server: menu 9 (is the service running / listening on [::]?"
             echo "     was it created in IPv4 mode? wrong tunnel port typed on the Kharej side?)"
             ;;
         UNREACH)
@@ -730,116 +723,26 @@ diagnose_connect() {
             echo "  => The SYN gets NO answer. Ping working only proves ICMP passes; TCP is being dropped."
             if [ "$other_open" = "1" ]; then
                 echo "     Other TCP ports on that host answer, only port ${port} does not -> port-specific block."
-                echo "     Fix: open ${port}/tcp on the Iran server (menu 7 -> 9) AND in the provider panel / cloud"
+                echo "     Fix: open ${port}/tcp on the Iran server (menu 9 re-applies the firewall) AND in the provider panel / cloud"
                 echo "     firewall, or recreate the tunnel on a port that is open (e.g. 443 or 8443)."
             else
                 echo "     No TCP port of that host answers over IPv${fam} (22/443/80 too) while ping works ->"
                 echo "     TCP over IPv${fam} to that host is filtered upstream (provider firewall / ISP), or the host"
-                echo "     firewall drops everything. If the Iran side already opened its firewall (menu 7 -> 9),"
+                echo "     firewall drops everything. If the Iran side already opened its firewall (menu 9),"
                 echo "     use IPv4 for this tunnel, or ask the provider to allow inbound IPv${fam} TCP."
             fi
-            echo "     Decisive test: on the Iran server run menu 7 -> 8 while this client retries:"
-            echo "       SYN packets seen  -> blocked on that server (firewall / not listening)"
-            echo "       no SYN seen       -> blocked BEFORE it (provider firewall, ISP, wrong IP)"
+            echo "     Then re-check with menu 9 (IPv6 check + repair) on the Iran server."
             ;;
     esac
     echo ""
 }
 
-diagnose_clients() {
-    # Kharej: run the connectivity test against every configured Iran server
-    local u toml host port found=0
-    for u in $(list_tunnel_units); do
-        toml=$(unit_toml "$u")
-        [ -f "$toml" ] || continue
-        grep -q '^\[client\]' "$toml" || continue
-        host=$(toml_peer_host "$toml")
-        port=$(toml_tunnel_port "$toml")
-        [ -n "$host" ] && [ -n "$port" ] || continue
-        found=1
-        diagnose_connect "$host" "$port"
-    done
-    [ "$found" = "1" ] || echo "No Kharej client config found on this machine (run this on the Kharej server)."
-}
 
 fw_active() {
     ip6tables -S BACKHAUL_FW >/dev/null 2>&1 || iptables -S BACKHAUL_FW >/dev/null 2>&1
 }
 
-iran_check() {
-    # Iran: what is listening, and which firewall layers could be dropping the port?
-    local toml port bind fam found=0
-    ensure_cmds ss ip >/dev/null 2>&1
-    for toml in "$INSTALL_DIR"/*.toml; do
-        [ -f "$toml" ] || continue
-        grep -q '^\[server\]' "$toml" || continue
-        found=1
-        bind=$(toml_str "$toml" bind_addr)
-        port=${bind##*:}
-        fam=$(toml_family "$toml")
-        echo ""
-        echo "=== $(basename "$toml")  (bind ${bind}, IPv${fam}) ==="
-        if check_listener "$port" "$fam"; then echo "  Listener: OK"; fi
-        echo "  Service : $(systemctl is-active "backhaul-$(basename "$toml" .toml).service" 2>/dev/null)"
-    done
-    if [ "$found" = "0" ]; then
-        echo "No Iran server config found on this machine (run this on the Iran server)."
-        return 0
-    fi
-    echo ""
-    echo "=== Firewall layers on this server ==="
-    if command -v ufw >/dev/null 2>&1; then echo "ufw       : $(ufw status 2>/dev/null | head -n1)"; fi
-    if command -v firewall-cmd >/dev/null 2>&1; then echo "firewalld : $(firewall-cmd --state 2>&1 | head -n1)"; fi
-    echo "iptables  INPUT: $(iptables -S INPUT 2>/dev/null | head -n1)"
-    echo "ip6tables INPUT: $(ip6tables -S INPUT 2>/dev/null | head -n1)"
-    if fw_active; then
-        echo "BACKHAUL_FW chain (ACCEPT for the tunnel / inbound ports): present"
-        ip6tables -L BACKHAUL_FW -n -v 2>/dev/null | sed 's/^/  v6 /' | head -n 12
-    else
-        echo "BACKHAUL_FW chain: not present -> menu 7 -> 9 opens the ports"
-    fi
-    if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -qE 'hook input'; then
-        echo "nftables  : input hooks exist (native nft rules, not touched by this script) — check: nft list ruleset"
-    fi
-    echo ""
-    echo "A firewall in the PROVIDER panel (security group / cloud firewall) cannot be seen or changed from here."
-    echo "If everything above looks fine and the client still times out: menu 7 -> 8 (watch incoming SYN)."
-}
 
-watch_syn() {
-    # Iran: the decisive test — do the client's SYN packets arrive at all?
-    local -a tomls=()
-    local toml port out n
-    mapfile -t tomls < <(grep -l '^\[server\]' "$INSTALL_DIR"/*.toml 2>/dev/null)
-    if [ "${#tomls[@]}" -eq 0 ]; then
-        echo "No Iran server config found on this machine (run this on the Iran server)."
-        return 0
-    fi
-    if [ "${#tomls[@]}" -eq 1 ]; then
-        toml="${tomls[0]}"
-    else
-        choose toml "Config" "${tomls[@]}" || return 0
-    fi
-    port=$(toml_tunnel_port "$toml")
-    ensure_cmds tcpdump || { echo "tcpdump is not available — cannot watch."; return 0; }
-    echo "Watching up to 25s for incoming TCP SYN packets on port ${port} (IPv4 + IPv6)."
-    echo "Restart the Kharej client now:  systemctl restart <backhaul-kharej-...service>"
-    out=$(timeout 25 tcpdump -l -ni any -c 10 \
-        "(ip6 and ip6[6] = 6 and ip6[53] & 18 = 2 and ip6[42:2] = ${port}) or (ip and tcp[tcpflags] & 18 = 2 and dst port ${port})" 2>/dev/null)
-    n=$(printf '%s\n' "$out" | grep -cE ' IP6? ')
-    echo ""
-    if [ "${n:-0}" -gt 0 ]; then
-        printf '%s\n' "$out" | grep -E ' IP6? ' | head -n 5 | sed 's/^/  /'
-        echo ""
-        echo "=> SYN packets ARRIVE at this server, yet the tunnel does not come up: the problem is HERE."
-        echo "   - the firewall drops them: menu 7 -> 9 (and check 'ip6tables -S INPUT')"
-        echo "   - or nothing listens on that family: menu 7 -> 7"
-    else
-        echo "=> NO SYN reached this server in 25s. The packets are blocked BEFORE this machine:"
-        echo "   provider firewall / security group, an ISP filter on IPv6 TCP (or on this port), or the client"
-        echo "   uses a wrong address/port. Try: another port (443 / 8443), IPv4 instead of IPv6, or ask the provider."
-    fi
-}
 
 # ============================================================
 # Firewall opening (Iran side)
@@ -1354,253 +1257,15 @@ detect_and_apply_mss() {
     sync_toml_mss && echo "tcp/tcpmux configs updated — restart those services (menu 4) to use the new mss."
 }
 
-set_mss_manually() {
-    local v6 v4
-    mss_load_env
-    ask v6 "IPv6 MSS (1100-1440) [${MSS_V6}]: " "$MSS_V6"
-    ask v4 "IPv4 MSS (1100-1460) [${MSS_V4}]: " "$MSS_V4"
-    if ! [[ "$v6" =~ ^[0-9]+$ ]] || [ "$v6" -lt 1100 ] || [ "$v6" -gt 1440 ]; then echo "Invalid IPv6 MSS."; return 0; fi
-    if ! [[ "$v4" =~ ^[0-9]+$ ]] || [ "$v4" -lt 1100 ] || [ "$v4" -gt 1460 ]; then echo "Invalid IPv4 MSS."; return 0; fi
-    MSS_V6=$v6
-    MSS_V4=$v4
-    setup_mss_protection
-    sync_toml_mss && echo "tcp/tcpmux configs updated — restart those services (menu 4) to use the new mss."
-}
 
-diagnose_tunnel() {
-    local iface mtu u toml port peer pm fam m cur l out
-    ensure_cmds ip ss ping >/dev/null 2>&1
-    iface=$(detect_default_iface)
-    mtu=$(cat "/sys/class/net/${iface}/mtu" 2>/dev/null)
-    mss_load_env
-    echo ""
-    echo "=== Network ==="
-    echo "Default interface : ${iface} (MTU ${mtu:-?})"
-    echo "Global IPv6       : $(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | head -n3 | tr '\n' ' ')"
-    echo "IPv6 default route: $(ip -6 route show default 2>/dev/null | head -n1)"
-    echo "tcp_mtu_probing   : $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null)"
-    echo "congestion / qdisc: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) / $(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    echo "Configured MSS    : IPv6=${MSS_V6}  IPv4=${MSS_V4}"
 
-    echo ""
-    echo "=== MSS clamp / firewall rules (packet counters grow when a tunnel (re)connects) ==="
-    if [ -f "$MSS_SCRIPT" ]; then bash "$MSS_SCRIPT" status; else echo "Not installed — use menu 7 -> 1."; fi
 
-    echo ""
-    echo "=== Live tunnel sockets (mss / pmtu / rtt / retrans) ==="
-    for u in $(list_tunnel_units); do
-        toml=$(unit_toml "$u")
-        [ -f "$toml" ] || continue
-        port=$(toml_tunnel_port "$toml")
-        echo "--- $u (port $port) ---"
-        ss -H -tin state established "( sport = :${port} or dport = :${port} )" 2>/dev/null | paste - - | head -n 6 | while IFS= read -r l; do
-            peer=$(echo "$l" | awk '{print $4}')
-            echo "  ${peer}   $(echo "$l" | tr ' \t' '\n\n' | grep -E '^(rtt|mss|pmtu|retrans|cwnd|unacked):' | tr '\n' ' ')"
-        done
-    done
 
-    echo ""
-    echo "=== Path to the other server ==="
-    while IFS= read -r peer; do
-        [ -n "$peer" ] || continue
-        echo "--- ${peer} ---"
-        if ! ping_ok "$peer" 3 2; then
-            echo "  No ICMP echo reply: cannot measure (ICMP filtered or host unreachable)."
-            echo "  The MSS clamp still protects the tunnel; if data still stalls, lower the MSS (menu 7 -> 3, e.g. 1160)."
-            continue
-        fi
-        pm=$(probe_pmtu "$peer")
-        if [[ "$peer" == *:* ]]; then fam=6; cur=$MSS_V6; else fam=4; cur=$MSS_V4; fi
-        if [ -n "$pm" ]; then
-            m=$(mss_from_mtu "$pm" "$fam")
-            echo "  Path MTU (echo, both directions): ${pm}   -> MSS that fits: ${m}"
-            if [ "$cur" -le "$m" ]; then
-                echo "  OK: configured MSS ${cur} fits the measured path."
-            else
-                echo "  PROBLEM: configured MSS ${cur} is larger than the path allows (${m}) -> menu 7 -> 2."
-            fi
-        else
-            echo "  Path MTU could not be measured."
-        fi
-        out=$(run_ping "$peer" -n -c 20 -i 0.2 -W 2 -s 56 2>&1 | grep -E 'packet loss')
-        echo "  small packets (56B) : ${out:-no result}"
-        if [ "$fam" = "6" ]; then l=1232; else l=1372; fi
-        out=$(run_ping "$peer" -n -c 20 -i 0.2 -W 2 -M 'do' -s "$l" 2>&1 | grep -E 'packet loss')
-        echo "  large packets (${l}B): ${out:-no result}"
-        echo "  (loss only on the large packets = path-MTU / size filtering problem)"
-    done < <(peer_list)
-    echo ""
-}
 
-mtu_menu() {
-    local c
-    while true; do
-        mss_load_env
-        echo ""
-        echo "=== Connection / MTU / MSS tools ==="
-        echo "MSS clamp: $(mss_active && echo ACTIVE || echo "not active")   (IPv6 MSS ${MSS_V6}, IPv4 MSS ${MSS_V4})    Firewall ACCEPT chain: $(fw_active && echo ACTIVE || echo "not active")"
-        echo "-- Tunnel does not connect ('i/o timeout', ping works) --"
-        echo "6) Kharej: TCP connection test to the Iran server(s)  (tells you why it times out)"
-        echo "7) Iran:   listener + firewall check"
-        echo "8) Iran:   watch incoming SYN packets while the client retries  (decisive test)"
-        echo "9) Iran:   open the firewall for the tunnel / inbound ports now"
-        echo "-- Connected but data stalls / pages load half --"
-        echo "1) Apply / refresh the MSS clamp now (recommended)"
-        echo "2) Detect the real path MTU to the other server and use it"
-        echo "3) Set MSS manually"
-        echo "4) Diagnostics (path MTU, packet loss, live tunnel sockets)"
-        echo "5) Remove the MSS clamp (firewall ACCEPT rules stay)"
-        echo "10) Iran: MSS clamp on the user-facing inbound ports is $([ "$MSS_INBOUND" = "1" ] && echo ON || echo OFF) — toggle"
-        echo "0) Back"
-        ask c "Select: "
-        case "$c" in
-            1) setup_mss_protection ;;
-            2) detect_and_apply_mss ;;
-            3) set_mss_manually ;;
-            4) diagnose_tunnel ;;
-            5) mss_load_env
-               MSS_ON=0
-               mss_save_env
-               if [ -f "$MSS_SCRIPT" ]; then bash "$MSS_SCRIPT" apply; fi
-               echo "MSS clamp removed (tcp/tcpmux configs keep their native mss line)." ;;
-            6) diagnose_clients ;;
-            7) iran_check ;;
-            8) watch_syn ;;
-            9) mss_load_env
-               FW_OPEN=1
-               if [ -z "$(collect_reserved_ports)" ]; then
-                   echo "No Iran server config on this machine — nothing to open (run this on the Iran server)."
-               else
-                   setup_net_rules
-                   echo "Also check the PROVIDER panel / cloud firewall: it must allow the same TCP ports."
-               fi ;;
-            10) mss_load_env
-                if [ "$MSS_INBOUND" = "1" ]; then MSS_INBOUND=0; else MSS_INBOUND=1; fi
-                MSS_ON=1
-                setup_net_rules
-                echo "Inbound-port MSS clamp is now $([ "$MSS_INBOUND" = "1" ] && echo ON || echo OFF)." ;;
-            0) return ;;
-            *) echo "Invalid option." ;;
-        esac
-    done
-}
+
 
 # ============================================================
-# Binary update (official Musixal/Backhaul releases only)
-# ============================================================
-
-backhaul_installed_version() {
-    "$INSTALL_DIR/backhaul" -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
-}
-
-latest_backhaul_tag() {
-    # latest release tag of the official repo (API first, then the /releases/latest redirect)
-    local tag
-    tag=$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-        | grep -m1 '"tag_name"' | cut -d'"' -f4)
-    if [ -z "$tag" ]; then
-        tag=$(curl -fsSL --max-time 20 -o /dev/null -w '%{url_effective}' \
-            "https://github.com/${REPO}/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p')
-    fi
-    echo "$tag"
-}
-
-update_backhaul() {
-    local cur latest latn asset_arch url tmpd u bad=0
-    local -a active=()
-    ensure_cmds curl tar >/dev/null 2>&1
-    mkdir -p "$INSTALL_DIR"
-    cur=$(backhaul_installed_version)
-    echo ""
-    echo "=== Update the Backhaul binary (official ${REPO} releases) ==="
-    echo "Checking the latest release on GitHub..."
-    latest=$(latest_backhaul_tag)
-    echo "  installed : ${cur:-not installed}"
-    echo "  latest    : ${latest:-unknown}"
-    if [ -z "$latest" ] && [ -z "${BACKHAUL_URL:-}" ]; then
-        echo "Could not read the latest release (GitHub not reachable from this server?)."
-        echo "Download backhaul_linux_<arch>.tar.gz on another machine, copy it here and run:"
-        echo "  BACKHAUL_URL=/path/backhaul_linux_amd64.tar.gz bash <this script>   (then menu 11)"
-        return 0
-    fi
-    latn=${latest#v}
-    if [ -n "$cur" ] && [ "$cur" = "$latn" ] && [ -z "${BACKHAUL_URL:-}" ]; then
-        echo "Already on the latest official version — nothing to do."
-        echo "(Do the same check on the OTHER server: both sides should run the same version.)"
-        return 0
-    fi
-    if ! ask_yn "Install ${latest:-the file from BACKHAUL_URL}? (running tunnels restart for a few seconds)" y; then
-        return 0
-    fi
-    case "$(uname -m)" in
-        x86_64|amd64) asset_arch="amd64" ;;
-        aarch64|arm64) asset_arch="arm64" ;;
-        *) echo "Unsupported architecture: $(uname -m)"; return 1 ;;
-    esac
-    url="${BACKHAUL_URL:-https://github.com/${REPO}/releases/download/${latest}/backhaul_linux_${asset_arch}.tar.gz}"
-    tmpd=$(mktemp -d)
-    if [ -f "$url" ]; then
-        cp "$url" "$tmpd/b.tar.gz"
-    else
-        echo "Downloading: $url"
-        if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$tmpd/b.tar.gz" "$url"; then
-            echo "Download failed — nothing changed."
-            rm -rf "$tmpd"
-            return 1
-        fi
-    fi
-    if ! tar -tzf "$tmpd/b.tar.gz" >/dev/null 2>&1 || ! tar -xzf "$tmpd/b.tar.gz" -C "$tmpd" || [ ! -f "$tmpd/backhaul" ]; then
-        echo "The download is not a valid Backhaul archive — nothing changed."
-        rm -rf "$tmpd"
-        return 1
-    fi
-    chmod +x "$tmpd/backhaul"
-    if ! "$tmpd/backhaul" -v >/dev/null 2>&1; then
-        echo "The new binary does not run on this machine — nothing changed."
-        rm -rf "$tmpd"
-        return 1
-    fi
-    echo "New binary reports: $("$tmpd/backhaul" -v 2>/dev/null | head -n1)"
-
-    for u in $(list_tunnel_units); do
-        systemctl is-active --quiet "$u" && active+=("$u")
-    done
-    [ -x "$INSTALL_DIR/backhaul" ] && cp -p "$INSTALL_DIR/backhaul" "$INSTALL_DIR/backhaul.bak"
-    cp "$tmpd/backhaul" "$INSTALL_DIR/backhaul.new" && chmod +x "$INSTALL_DIR/backhaul.new" \
-        && mv -f "$INSTALL_DIR/backhaul.new" "$INSTALL_DIR/backhaul"
-    rm -rf "$tmpd"
-    echo "Binary replaced (old one kept as backhaul.bak)."
-
-    for u in "${active[@]}"; do
-        systemctl restart "$u" >/dev/null 2>&1
-    done
-    if [ "${#active[@]}" -gt 0 ]; then
-        echo "Restarted ${#active[@]} tunnel service(s); checking they stay up..."
-        sleep 6
-        for u in "${active[@]}"; do
-            if systemctl is-active --quiet "$u"; then
-                echo "  OK    $u"
-            else
-                echo "  DOWN  $u"
-                bad=1
-            fi
-        done
-    fi
-    if [ "$bad" = "1" ] && [ -f "$INSTALL_DIR/backhaul.bak" ]; then
-        echo "A service did not come up with the new binary — rolling back to the previous version."
-        mv -f "$INSTALL_DIR/backhaul.bak" "$INSTALL_DIR/backhaul"
-        for u in "${active[@]}"; do
-            systemctl restart "$u" >/dev/null 2>&1
-        done
-        echo "Rolled back to: $(backhaul_installed_version)"
-        return 1
-    fi
-    echo "Now running: $(backhaul_installed_version).  Repeat this on the OTHER server (same version on both sides)."
-    return 0
-}
-
-# ============================================================
-# IPv6 check + repair  (menu 12; runs automatically after an IPv6 install)
+# IPv6 check + repair  (menu 9; runs automatically after an IPv6 install)
 # ============================================================
 
 ipv6_repair() {
@@ -1698,7 +1363,7 @@ ipv6_repair() {
     if [ "$auto" = "auto" ] || ask_yn "Measure the real path MTU to the other server and set the MSS now?" y; then
         detect_and_apply_mss
         if [ "$found_srv" = "1" ] && [ "$auto" = "auto" ]; then
-            echo "    (On the Iran side the other end is only known once the Kharej is connected: run menu 12 here again"
+            echo "    (On the Iran side the other end is only known once the Kharej is connected: run menu 9 here again"
             echo "     after the Kharej client is up, so the MSS is measured against the real peer.)"
         fi
     fi
@@ -1715,266 +1380,13 @@ ipv6_repair() {
     return 0
 }
 
-# ============================================================
-# Port-forward check  (menu 13)
-# ============================================================
 
-forward_check() {
-    local toml e spec addrs r4 r6 u t found_srv=0 found_cli=0 tports
-    local -a TP=()
-    ensure_cmds ss >/dev/null 2>&1
-    echo ""
-    echo "=== Port-forward check ==="
-    for toml in "$INSTALL_DIR"/*.toml; do
-        [ -f "$toml" ] || continue
-        grep -q '^\[server\]' "$toml" || continue
-        found_srv=1
-        echo "--- Iran: $(basename "$toml") ---"
-        while IFS= read -r e; do
-            [ -n "$e" ] || continue
-            spec=$(entry_local_spec "$e")
-            if ! [[ "$spec" =~ ^[0-9]+$ ]]; then
-                echo "  ${e}: port range — not tested"
-                continue
-            fi
-            addrs=$(ss -H -ltn "( sport = :${spec} )" 2>/dev/null | awk '{print $4}' | paste -sd' ' -)
-            r4=$(tcp_probe 127.0.0.1 "$spec" 3)
-            r6=$(tcp_probe ::1 "$spec" 3)
-            printf '  %-20s listens: %-26s local IPv4: %-8s local IPv6: %s\n' "$e" "${addrs:-NOTHING}" "$r4" "$r6"
-            if [ -z "$addrs" ]; then
-                echo "     -> nothing listens on ${spec}: the tunnel service is down, or the port is taken by another program."
-            elif [ "$r4" = "OPEN" ] && [ "$r6" != "OPEN" ]; then
-                echo "     -> reachable over IPv4 only: IPv6 users cannot connect (IPv6 off in the kernel?). Run menu 12."
-            elif [ "$r4" = "OPEN" ] && [ "$r6" = "OPEN" ]; then
-                echo "     -> OK locally for IPv4 and IPv6. From outside it also needs the firewall (menu 7 -> 7 / 9)"
-                echo "        and the provider-panel firewall to allow TCP ${spec} for IPv6."
-            fi
-        done < <(sed -n '/^ports = \[/,/^\]/p' "$toml" | grep -oE '"[^"]+"' | tr -d '"')
-    done
-    for u in $(list_tunnel_units); do
-        toml=$(unit_toml "$u")
-        [ -n "$toml" ] && [ -f "$toml" ] || continue
-        grep -q '^\[client\]' "$toml" && found_cli=1
-    done
-    if [ "$found_cli" = "1" ]; then
-        echo ""
-        echo "--- Kharej: do the forward targets answer on this machine? ---"
-        ask tports "Target port(s) that the Iran inbound ports forward to (comma separated, Enter = skip): "
-        tports="${tports// /}"
-        if [ -n "$tports" ]; then
-            IFS=',' read -ra TP <<< "$tports"
-            for t in "${TP[@]}"; do
-                valid_port "$t" || { echo "  ${t}: not a port"; continue; }
-                r4=$(tcp_probe 127.0.0.1 "$t" 3)
-                r6=$(tcp_probe ::1 "$t" 3)
-                printf '  target %-6s 127.0.0.1: %-8s [::1]: %s\n' "$t" "$r4" "$r6"
-                if [ "$r4" != "OPEN" ] && [ "$r6" = "OPEN" ]; then
-                    echo "     -> the backend listens on IPv6 loopback only. My understanding is that the Backhaul client dials"
-                    echo "        IPv4 (127.0.0.1) — not verified. Make the backend listen on 0.0.0.0 or :: (dual-stack)."
-                elif [ "$r4" != "OPEN" ] && [ "$r6" != "OPEN" ]; then
-                    echo "     -> nothing answers on port ${t}: start the backend (x-ui / xray / ...) or fix the target port."
-                else
-                    echo "     -> OK"
-                fi
-            done
-        fi
-    fi
-    if [ "$found_srv" = "0" ] && [ "$found_cli" = "0" ]; then
-        echo "No Backhaul config found on this machine."
-    fi
-    echo ""
-    echo "Note: Backhaul cannot forward to an IPv6 literal target (\"443=[::1]:5201\"); targets are IPv4 / local ports."
-}
 
-# ============================================================
-# System tuning: MTU cap, DNS, ulimits, optimizer
-# ============================================================
 
-ensure_mtu() {
-    echo ""
-    echo "=== Capping the NIC MTU at ${MTU_CAP} (only ever lowers it) ==="
-    mkdir -p "$INSTALL_DIR"
-    cat > "$INSTALL_DIR/mtu.sh" << 'MTUEOF'
-#!/bin/bash
-CAP="${1:-1400}"
-iface=$(ip -o -4 route show to default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
-[ -z "$iface" ] && iface=$(ip -o -6 route show to default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
-[ -z "$iface" ] && exit 0
-cur=$(cat "/sys/class/net/$iface/mtu" 2>/dev/null || echo 0)
-if [ "$cur" -gt "$CAP" ]; then
-    ip link set dev "$iface" mtu "$CAP" && echo "MTU of $iface lowered from $cur to $CAP"
-else
-    echo "MTU of $iface is $cur (<= $CAP): left unchanged"
-fi
-exit 0
-MTUEOF
-    chmod +x "$INSTALL_DIR/mtu.sh"
 
-    cat > "$SYSTEMD_DIR/backhaul-mtu.service" << EOF
-[Unit]
-Description=Cap NIC MTU at ${MTU_CAP} for the Backhaul tunnel (never raises it)
-After=network-online.target
-Wants=network-online.target
 
-[Service]
-Type=oneshot
-ExecStart=/bin/bash ${INSTALL_DIR}/mtu.sh ${MTU_CAP}
-RemainAfterExit=yes
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable backhaul-mtu.service >/dev/null 2>&1
-    bash "$INSTALL_DIR/mtu.sh" "$MTU_CAP"
-}
 
-ensure_dns() {
-    echo ""
-    echo "=== Setting DNS (Cloudflare / Google) ==="
-    local n ok4=0 ok6=0
-    local -a lines=()
-    mkdir -p "$INSTALL_DIR"
-    # only use the IP families this host can actually reach (a dead first nameserver = 5s per lookup)
-    for n in 1.1.1.1 1.0.0.1 8.8.8.8; do
-        if ping_ok "$n" 1 2; then ok4=1; break; fi
-    done
-    for n in 2606:4700:4700::1111 2001:4860:4860::8888; do
-        if ping_ok "$n" 1 2; then ok6=1; break; fi
-    done
-    if [ "$ok4" = 0 ] && [ "$ok6" = 0 ]; then
-        echo "None of the public resolvers answered ping — DNS left untouched."
-        return 0
-    fi
-    [ "$ok4" = 1 ] && lines+=("nameserver 1.1.1.1" "nameserver 1.0.0.1" "nameserver 8.8.8.8")
-    [ "$ok6" = 1 ] && lines+=("nameserver 2606:4700:4700::1111" "nameserver 2001:4860:4860::8888")
-
-    chattr -i "$RESOLV_CONF" 2>/dev/null
-    # back up the original once, so uninstall can restore it
-    if [ ! -f "$INSTALL_DIR/resolv.conf.orig" ] && [ ! -f "$INSTALL_DIR/resolv.conf.link" ]; then
-        if [ -L "$RESOLV_CONF" ]; then
-            readlink "$RESOLV_CONF" > "$INSTALL_DIR/resolv.conf.link"
-        elif [ -f "$RESOLV_CONF" ]; then
-            cp "$RESOLV_CONF" "$INSTALL_DIR/resolv.conf.orig"
-        fi
-    fi
-    if [ -L "$RESOLV_CONF" ]; then
-        # usually systemd-resolved's stub: replace the symlink with a static file so it isn't reset
-        rm -f "$RESOLV_CONF"
-    fi
-    {
-        printf '%s\n' "${lines[@]}"
-        echo "options timeout:2 attempts:2"
-    } > "$RESOLV_CONF"
-    # Best-effort: stop NetworkManager / dhcp clients from overwriting it back.
-    chattr +i "$RESOLV_CONF" 2>/dev/null
-    echo "DNS set (${lines[*]//nameserver /}). ${RESOLV_CONF} is now static/locked (chattr +i); uninstall can restore it."
-}
-
-ensure_ulimits() {
-    echo ""
-    echo "=== Raising file descriptor limits ==="
-    if ! grep -q "^fs.file-max" "${SYSCTL_DIR}/99-backhaul-tunnel.conf" 2>/dev/null; then
-        echo "fs.file-max=2097152" >> "${SYSCTL_DIR}/99-backhaul-tunnel.conf"
-    fi
-    sysctl -w fs.file-max=2097152 > /dev/null 2>&1
-
-    if ! grep -q "backhaul-tunnel limits" "$LIMITS_FILE" 2>/dev/null; then
-        cat >> "$LIMITS_FILE" << EOF
-
-# backhaul-tunnel limits
-root soft nofile 1048576
-root hard nofile 1048576
-* soft nofile 1048576
-* hard nofile 1048576
-EOF
-    fi
-    ulimit -n 1048576 2>/dev/null
-    echo "File descriptor limits raised (the services also get LimitNOFILE=1048576 from systemd)."
-}
-
-optimize_system() {
-    local conf="${SYSCTL_DIR}/99-backhaul-tunnel.conf" tmp kv key
-    local -a skipped=()
-    local -a SETTINGS=(
-        "net.core.default_qdisc=fq"
-        "net.ipv4.tcp_congestion_control=bbr"
-        "net.core.somaxconn=65535"
-        "net.core.netdev_max_backlog=250000"
-        "net.core.rmem_max=134217728"
-        "net.core.wmem_max=134217728"
-        "net.ipv4.tcp_rmem=4096 87380 134217728"
-        "net.ipv4.tcp_wmem=4096 65536 134217728"
-        "net.ipv4.tcp_keepalive_time=60"
-        "net.ipv4.tcp_keepalive_intvl=10"
-        "net.ipv4.tcp_keepalive_probes=6"
-        "net.ipv4.tcp_fin_timeout=15"
-        "net.ipv4.tcp_mtu_probing=1"
-        "net.ipv4.tcp_window_scaling=1"
-        "net.ipv4.tcp_timestamps=1"
-        "net.ipv4.tcp_sack=1"
-        "net.ipv4.tcp_retries2=8"
-        "net.ipv4.tcp_syn_retries=2"
-        "net.ipv4.tcp_slow_start_after_idle=0"
-        "net.ipv4.tcp_no_metrics_save=1"
-    )
-    echo ""
-    echo "=== System Optimization ==="
-    echo "Interface: $(detect_default_iface)"
-    modprobe tcp_bbr >/dev/null 2>&1
-
-    # keep fs.file-max if ensure_ulimits wrote it earlier; rebuild the rest from what the kernel accepts
-    tmp=$(mktemp)
-    grep "^fs.file-max" "$conf" 2>/dev/null > "$tmp"
-    {
-        echo "# Written by the Backhaul tunnel manager ${VERSION} — only keys the kernel accepted."
-    } >> "$tmp"
-    for kv in "${SETTINGS[@]}"; do
-        key=${kv%%=*}
-        if sysctl -w "$kv" > /dev/null 2>&1; then
-            echo "$kv" >> "$tmp"
-        else
-            skipped+=("$key")
-        fi
-    done
-    mv "$tmp" "$conf"
-    chmod 644 "$conf"
-
-    if grep -q '^net.ipv4.tcp_congestion_control=bbr' "$conf"; then
-        echo "BBR congestion control enabled."
-        echo "tcp_bbr" > "${MODULES_DIR}/backhaul-bbr.conf" 2>/dev/null
-    else
-        echo "BBR is not available on this kernel — staying on the default congestion control."
-    fi
-    [ "${#skipped[@]}" -gt 0 ] && echo "Not supported by this kernel (skipped): ${skipped[*]}"
-    echo "Saved to $conf (persists across reboots)."
-    echo "Note: Backhaul itself also re-applies a few sysctls (buffers, tcp_tw_reuse, port range...) at every start."
-
-    update_reserved_ports
-    ensure_ulimits
-    ensure_mtu
-    ensure_dns
-
-    echo ""
-    echo "Optimization complete."
-}
-
-revert_tuning() {
-    chattr -i "$RESOLV_CONF" 2>/dev/null
-    if [ -f "$INSTALL_DIR/resolv.conf.link" ]; then
-        rm -f "$RESOLV_CONF"
-        ln -s "$(cat "$INSTALL_DIR/resolv.conf.link")" "$RESOLV_CONF"
-        echo "DNS: ${RESOLV_CONF} symlink restored."
-    elif [ -f "$INSTALL_DIR/resolv.conf.orig" ]; then
-        cat "$INSTALL_DIR/resolv.conf.orig" > "$RESOLV_CONF"
-        echo "DNS: original ${RESOLV_CONF} restored."
-    fi
-    rm -f "${SYSCTL_DIR}/99-backhaul-tunnel.conf" "${SYSCTL_DIR}/98-backhaul-ipv6.conf" \
-          "${SYSCTL_DIR}/97-backhaul-mtu.conf" "${SYSCTL_DIR}/96-backhaul-reserved.conf" \
-          "${MODULES_DIR}/backhaul-bbr.conf"
-    sed -i '/^# backhaul-tunnel limits$/,/^\* hard nofile 1048576$/d' "$LIMITS_FILE" 2>/dev/null
-    echo "Sysctl drop-ins and limits.conf entries removed (live values are reset at the next reboot)."
-}
 
 # ============================================================
 # Watchdog (health check + auto-restart with back-off)
@@ -2157,13 +1569,13 @@ show_status() {
     if mss_active; then
         echo "MSS clamp: ACTIVE  (IPv6 MSS ${MSS_V6}, IPv4 MSS ${MSS_V4})"
     else
-        echo "MSS clamp: NOT active — enable it in menu 7 (needed for stable IPv6 tunnels)."
+        echo "MSS clamp: NOT active — it is applied automatically by the install / menu 9 (needed for stable IPv6 tunnels)."
     fi
     if grep -qs '^\[server\]' "$INSTALL_DIR"/*.toml 2>/dev/null; then
         if fw_active; then
             echo "Firewall ACCEPT for the tunnel / inbound ports: ACTIVE"
         else
-            echo "Firewall ACCEPT for the tunnel / inbound ports: NOT active — if clients time out, menu 7 -> 9."
+            echo "Firewall ACCEPT for the tunnel / inbound ports: NOT active — if clients time out, re-run the install or menu 9."
         fi
     fi
 
@@ -2194,16 +1606,16 @@ show_status() {
     else
         echo ""
         echo "If you see 'invalid security token', the token in the .toml files on the"
-        echo "two servers does not match — check with: grep token ${INSTALL_DIR}/*.toml  (menu 10 changes it)"
+        echo "two servers does not match — check with: grep token ${INSTALL_DIR}/*.toml  (menu 8 changes it)"
         echo "If you see 'invalid signal received for channel' ONCE (e.g. right after a start): usually a stray"
         echo "  connection / scanner on the tunnel port — harmless if the tunnel shows connections above."
         echo "  If it repeats every few seconds: token / transport mismatch, or different Backhaul versions"
         echo "  on the two servers (compare the 'Backhaul binary' line above on both)."
         echo "If you see 'i/o timeout' on the dialer: the SYN is not answered (firewall / provider / ISP filter)"
-        echo "  although ping works -> menu 12 (IPv6 repair), menu 7 -> 6 (Kharej) and menu 7 -> 7 / 8 / 9 (Iran)."
+        echo "  although ping works -> run menu 9 (IPv6 check + repair) on both servers."
         echo "If you see 'connection refused': nothing listens on that port/family on the Iran server."
         echo "If you see 'network is unreachable' on an IPv6 tunnel, the server has no working IPv6 route."
-        echo "If the tunnel connects but data stalls: menu 7 (MSS clamp + diagnostics)."
+        echo "If the tunnel connects but data stalls: menu 9 (IPv6 check + repair) re-measures the MSS."
     fi
 
     if [ -f "$WATCHDOG_LOG" ]; then
@@ -2258,7 +1670,7 @@ change_token() {
     done
     echo ""
     echo ">>> NEW TOKEN: ${new}"
-    echo ">>> Copy it to the other server(s) now (menu 10 there)."
+    echo ">>> Copy it to the other server(s) now (menu 8 there)."
 }
 
 # ============================================================
@@ -2458,15 +1870,11 @@ manage_services() {
 # ============================================================
 
 uninstall_all() {
-    local u revert=0
+    local u
     if ! ask_yn "This will remove ALL Backhaul services (including watchdog / MSS / firewall / MTU units) on THIS server. Continue?" n; then
         echo "Cancelled."
         return
     fi
-    if ask_yn "Also revert the system tuning done by this script (DNS lock, sysctl files, MTU cap, file limits)?" y; then
-        revert=1
-    fi
-
     [ -f "$MSS_SCRIPT" ] && bash "$MSS_SCRIPT" remove
     close_fw_managers
 
@@ -2476,8 +1884,6 @@ uninstall_all() {
     done
     systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
     rm -f "$SYSTEMD_DIR/backhaul-watchdog.timer" "$SYSTEMD_DIR/backhaul-watchdog.service"
-
-    [ "$revert" = "1" ] && revert_tuning
 
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
@@ -2622,6 +2028,13 @@ setup_iran_server() {
         fi
     done
 
+    if [ "$IP_MODE" = "6" ]; then
+        echo "Stable global IPv6 addresses on this server — give the Kharej side one of these"
+        echo "(never a temporary/deprecated one; temporary addresses are now disabled as a source):"
+        list_stable_ipv6 | sed 's/^/    /'
+        echo ""
+    fi
+
     # --- Tunnel port ---
     default_port=$(gen_port)
     echo "(Tip: if a random port is filtered on your provider/ISP, use a common one such as 443 or 8443.)"
@@ -2721,10 +2134,10 @@ EOF
     if [ "$FW_OPEN" = "1" ]; then
         echo ">>> The local firewall (ufw / firewalld / iptables$([ "$IP_MODE" = "6" ] && echo " + ip6tables")) was opened for TCP ${TUNNEL_PORT} and the inbound ports."
     else
-        echo ">>> Make sure the firewall allows TCP ${TUNNEL_PORT}$([ "$IP_MODE" = "6" ] && echo " for IPv6 as well (ip6tables / ufw with IPV6=yes)") — or run menu 7 -> 9."
+        echo ">>> Make sure the firewall allows TCP ${TUNNEL_PORT}$([ "$IP_MODE" = "6" ] && echo " for IPv6 as well (ip6tables / ufw with IPV6=yes)") — or run menu 9."
     fi
     echo ">>> A firewall in the PROVIDER panel (security group / cloud firewall) must allow TCP ${TUNNEL_PORT} too — this script cannot change that."
-    echo ">>> If the Kharej client later shows 'i/o timeout': menu 7 -> 8 here (watch incoming SYN) tells you where it is blocked."
+    echo ">>> If the Kharej client later shows 'i/o timeout': run menu 9 here and check the provider-panel firewall."
     echo ">>> Using several Iran servers? Run this script on each of them, then list them all on the Kharej server."
     return 0
 }
@@ -2734,9 +2147,9 @@ EOF
 # ============================================================
 
 setup_kharej_clients() {
-    local count i k ip port prev_port="" dup addr tag name toml mss n up r
+    local count i k ip port prev_port="" dup addr tag name toml mss n up
     local su stoml shost sport same_host keep cdef
-    local -a IPS=() PORTS=() SVCS=() TARGETS=() FAILED=()
+    local -a IPS=() PORTS=() SVCS=() TARGETS=()
 
     echo ""
     echo "This Kharej server can be tunnelled to several Iran servers at the same time"
@@ -2791,22 +2204,6 @@ setup_kharej_clients() {
             fi
             break
         done
-
-        # real TCP probe BEFORE creating the service: tells open / refused / timeout / no route
-        echo "  Testing TCP $(format_hostport "$ip" "$port") ..."
-        r=$(tcp_probe "$ip" "$port" 6)
-        if [ "$r" = "OPEN" ]; then
-            echo "  OK: $(format_hostport "$ip" "$port") accepts TCP connections."
-        else
-            echo "  Warning: $(format_hostport "$ip" "$port") did not accept the connection (${r})."
-            diagnose_connect "$ip" "$port" "$r"
-            FAILED+=("$(format_hostport "$ip" "$port")")
-            if ! ask_yn "Add this Iran server anyway (the client keeps retrying)?" y; then
-                echo "Enter it again."
-                i=$((i - 1))
-                continue
-            fi
-        fi
 
         IPS+=("$ip")
         PORTS+=("$port")
@@ -2896,12 +2293,7 @@ setup_kharej_clients() {
             echo "  OK    ${TARGETS[k]}  (${n} tunnel connection(s))"
         else
             echo "  WAIT  ${TARGETS[k]}  (no tunnel connection yet)"
-            r=$(tcp_probe "$(clean_ip_input "${IPS[k]}")" "${PORTS[k]}" 6)
-            case "$r" in
-                OPEN)    echo "        TCP port is open -> token / transport mismatch? compare both .toml files: grep -E 'token|transport' ${INSTALL_DIR}/*.toml" ;;
-                REFUSED) echo "        port refused -> nothing listens there (Iran service down / wrong port / IPv4-only listener): menu 7 -> 7 on the Iran server" ;;
-                *)       echo "        TCP ${r} -> firewall / provider / ISP filtering: menu 7 -> 6 here, menu 7 -> 8 on the Iran server" ;;
-            esac
+            echo "        check: menu 2 here and on the Iran server — or: journalctl -u ${SVCS[k]%.service} -n 30"
         fi
     done
 
@@ -3009,18 +2401,14 @@ install_flow() {
     fi
     if [ "$MSS_ENABLE" = "1" ]; then
         echo "MSS clamp: IPv6 MSS ${MSS_V6}, IPv4 MSS ${MSS_V4} — run this script on the OTHER server too."
-        echo "More: menu 7 -> 4 (diagnostics) / 2 (measure the real path MTU)."
+        echo "More: menu 9 (IPv6 check + repair)."
     fi
-    echo "Tunnel does not connect although ping works?  Menu 7 -> 6 (Kharej) / 7, 8, 9 (Iran)."
+    echo "Tunnel does not connect although ping works?  Run menu 9 (IPv6 check + repair) on both servers."
 
     # IPv6 tunnel: verify + repair right after the install (stable address, listener, firewall, probe, MSS)
     if { [ "$LOCAL_ROLE" = "Iran" ] && [ "$IP_MODE" = "6" ]; } \
         || { [ "$LOCAL_ROLE" = "Kharej" ] && grep -qsE '^remote_addr = "\[' "$INSTALL_DIR"/kharej-*.toml 2>/dev/null; }; then
         ipv6_repair auto
-    fi
-
-    if ask_yn "Run system optimizer now (BBR, buffers, MTU cap, DNS, ulimits)?" n; then
-        optimize_system
     fi
 
     if ask_yn "Install the watchdog (auto-restart on dead/idle tunnel)?" n; then
@@ -3047,30 +2435,22 @@ main() {
         echo "2) Show tunnel status"
         echo "3) Manage inbound ports (Iran side)"
         echo "4) Manage services (start/stop/restart/logs/edit/delete)"
-        echo "5) System optimizer (BBR + buffers + MTU cap + DNS + ulimits)"
-        echo "6) Install/repair Watchdog (auto-restart on dead/idle tunnel)"
-        echo "7) Connection tools: 'i/o timeout' diagnosis, firewall, MTU / MSS fix"
-        echo "8) Uninstall tunnel"
-        echo "9) Exit"
-        echo "10) Change the token (all tunnels on this server)"
-        echo "11) Update the Backhaul binary to the latest OFFICIAL release"
-        echo "12) IPv6 check + repair (after install: stable address, listener, firewall, probe, MSS)"
-        echo "13) Port-forward check (IPv4 / IPv6 listeners, backend targets)"
-        ask CHOICE "Select an option [1-13]: "
+        echo "5) Install/repair Watchdog (auto-restart on dead/idle tunnel)"
+        echo "6) Uninstall tunnel"
+        echo "7) Exit"
+        echo "8) Change the token (all tunnels on this server)"
+        echo "9) IPv6 check + repair (stable address, listener, firewall, probe, MSS)"
+        ask CHOICE "Select an option [1-9]: "
         case "$CHOICE" in
             1) install_flow ;;
             2) show_status ;;
             3) manage_ports ;;
             4) manage_services ;;
-            5) optimize_system ;;
-            6) setup_watchdog ;;
-            7) mtu_menu ;;
-            8) uninstall_all ;;
-            9) exit 0 ;;
-            10) change_token ;;
-            11) update_backhaul ;;
-            12) ipv6_repair ;;
-            13) forward_check ;;
+            5) setup_watchdog ;;
+            6) uninstall_all ;;
+            7) exit 0 ;;
+            8) change_token ;;
+            9) ipv6_repair ;;
             *) echo "Invalid option." ;;
         esac
     done
