@@ -31,8 +31,8 @@
 #     running). Service lists come from the unit files (disabled units used to vanish after a reboot).
 #   * Watchdog: exponential back-off (30s, 60s ... 600s) instead of restarting every 30s forever when
 #     the peer is down; respects "Stop" from the menu and disabled units; trims its own log.
-#   * Backhaul's server exits (Fatalf) if an inbound port can't be bound, and it re-binds all ports on
-#     every internal restart. v9 warns about ports already in use and reserves them
+#   * Backhaul's server exits (Fatalf) if an inbound port can't be bound (tcp, ws/wss, wsmux/wssmux), and
+#     it re-binds all ports on every internal restart. v9 warns about ports already in use and reserves them
 #     (ip_local_reserved_ports) so outgoing connections can't grab them meanwhile.
 #   * Inbound port entries are validated (Backhaul splits targets on ':' -> IPv6 literal targets break).
 #   * Optimizer: removed keys that don't exist / are obsolete (tcp_user_timeout, tcp_low_latency),
@@ -45,9 +45,9 @@
 #   * NOTE: Backhaul itself runs `sysctl -w` (tcp_tw_reuse=1, rmem/wmem_max up to 256MB, port range
 #     1024-65535, tcp_fastopen ...) at every start unless the config has skip_optz = true. It was
 #     left at its default; just be aware that it overrides same-named keys of the optimizer.
-#   * Token: still the fixed default "123" (as requested) — weak: anyone who can reach the tunnel port and
-#     guesses it can register as your client and receive the forwarded traffic. Override without
-#     editing the script:  BACKHAUL_TOKEN='long-random-string' bash script.sh   (same on all servers).
+#   * Token: still the fixed default "123" (as requested) — weak: the token is the ONLY authentication, so
+#     anyone who finds the tunnel port and guesses it can connect to your tunnel as a client. Override
+#     without editing the script:  BACKHAUL_TOKEN='long-random-string' bash script.sh  (same on all servers).
 #
 # Run this SEPARATELY on each server (every Iran server + the Kharej server).
 # Order: set up the Iran server(s) first, note their IP / tunnel port, then run the Kharej setup.
@@ -57,6 +57,10 @@ VERSION="v9"
 REPO="Musixal/Backhaul"
 INSTALL_DIR="${BACKHAUL_DIR:-/root/backhaul-core}"
 SYSTEMD_DIR="${BACKHAUL_SYSTEMD_DIR:-/etc/systemd/system}"
+SYSCTL_DIR="${BACKHAUL_SYSCTL_DIR:-/etc/sysctl.d}"
+LIMITS_FILE="${BACKHAUL_LIMITS_FILE:-/etc/security/limits.conf}"
+RESOLV_CONF="${BACKHAUL_RESOLV_CONF:-/etc/resolv.conf}"
+MODULES_DIR="${BACKHAUL_MODULES_DIR:-/etc/modules-load.d}"
 STATE_FILE="$INSTALL_DIR/state.env"
 FIXED_TOKEN="${BACKHAUL_TOKEN:-123}"
 WATCHDOG_SCRIPT="$INSTALL_DIR/watchdog.sh"
@@ -532,7 +536,7 @@ collect_reserved_ports() {
 
 update_reserved_ports() {
     # keep tunnel + inbound ports out of the ephemeral pool (Backhaul also widens the pool to 1024-65535)
-    local ours cur merged conf="/etc/sysctl.d/96-backhaul-reserved.conf"
+    local ours cur merged conf="${SYSCTL_DIR}/96-backhaul-reserved.conf"
     ours=$(collect_reserved_ports)
     if [ -z "$ours" ]; then
         rm -f "$conf"
@@ -548,7 +552,7 @@ update_reserved_ports() {
 prepare_ipv6() {
     # Make sure IPv6 is enabled in the kernel and listeners are dual-stack.
     # Returns 1 if the user wants to go back (no global IPv6 on this host).
-    local conf="/etc/sysctl.d/98-backhaul-ipv6.conf"
+    local conf="${SYSCTL_DIR}/98-backhaul-ipv6.conf"
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
     sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1
@@ -615,7 +619,7 @@ mss_from_mtu() {
 
 pingdf() {
     # one "don't fragment" probe with <payload> bytes of ICMP data; 0 = at least one reply
-    run_ping "$1" -n -c 3 -i 0.3 -W 2 -M do -s "$2" >/dev/null 2>&1
+    run_ping "$1" -n -c 3 -i 0.3 -W 2 -M 'do' -s "$2" >/dev/null 2>&1
 }
 
 probe_pmtu() {
@@ -857,13 +861,13 @@ sync_toml_mss() {
 }
 
 setup_mss_protection() {
-    mss_load_env
+    # uses the MSS_V6 / MSS_V4 currently in memory (callers load or change them first)
     ensure_cmds iptables ip6tables >/dev/null 2>&1
     write_mss_script
     write_mss_unit
     mss_save_env
     sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
-    echo "net.ipv4.tcp_mtu_probing=1" > /etc/sysctl.d/97-backhaul-mtu.conf
+    echo "net.ipv4.tcp_mtu_probing=1" > "${SYSCTL_DIR}/97-backhaul-mtu.conf"
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable backhaul-mss.service >/dev/null 2>&1
     echo ""
@@ -874,7 +878,7 @@ setup_mss_protection() {
         warn "the iptables MSS clamp could not be installed on this host."
         echo "         Falling back to tcp_mtu_probing=2 (works without ICMP, slightly slower ramp-up)."
         sysctl -w net.ipv4.tcp_mtu_probing=2 >/dev/null 2>&1
-        echo "net.ipv4.tcp_mtu_probing=2" > /etc/sysctl.d/97-backhaul-mtu.conf
+        echo "net.ipv4.tcp_mtu_probing=2" > "${SYSCTL_DIR}/97-backhaul-mtu.conf"
     fi
 }
 
@@ -975,7 +979,7 @@ diagnose_tunnel() {
         echo "--- $u (port $port) ---"
         ss -H -tin state established "( sport = :${port} or dport = :${port} )" 2>/dev/null | paste - - | head -n 6 | while IFS= read -r l; do
             peer=$(echo "$l" | awk '{print $4}')
-            echo "  ${peer}   $(echo "$l" | grep -oE '(rtt|mss|pmtu|retrans|cwnd|unacked):[^ ]+' | tr '\n' ' ')"
+            echo "  ${peer}   $(echo "$l" | tr ' \t' '\n\n' | grep -E '^(rtt|mss|pmtu|retrans|cwnd|unacked):' | tr '\n' ' ')"
         done
     done
 
@@ -1005,7 +1009,7 @@ diagnose_tunnel() {
         out=$(run_ping "$peer" -n -c 20 -i 0.2 -W 2 -s 56 2>&1 | grep -E 'packet loss')
         echo "  small packets (56B) : ${out:-no result}"
         if [ "$fam" = "6" ]; then l=1232; else l=1372; fi
-        out=$(run_ping "$peer" -n -c 20 -i 0.2 -W 2 -M do -s "$l" 2>&1 | grep -E 'packet loss')
+        out=$(run_ping "$peer" -n -c 20 -i 0.2 -W 2 -M 'do' -s "$l" 2>&1 | grep -E 'packet loss')
         echo "  large packets (${l}B): ${out:-no result}"
         echo "  (loss only on the large packets = path-MTU / size filtering problem)"
     done < <(peer_list)
@@ -1103,38 +1107,38 @@ ensure_dns() {
     [ "$ok4" = 1 ] && lines+=("nameserver 1.1.1.1" "nameserver 1.0.0.1" "nameserver 8.8.8.8")
     [ "$ok6" = 1 ] && lines+=("nameserver 2606:4700:4700::1111" "nameserver 2001:4860:4860::8888")
 
-    chattr -i /etc/resolv.conf 2>/dev/null
+    chattr -i "$RESOLV_CONF" 2>/dev/null
     # back up the original once, so uninstall can restore it
     if [ ! -f "$INSTALL_DIR/resolv.conf.orig" ] && [ ! -f "$INSTALL_DIR/resolv.conf.link" ]; then
-        if [ -L /etc/resolv.conf ]; then
-            readlink /etc/resolv.conf > "$INSTALL_DIR/resolv.conf.link"
-        elif [ -f /etc/resolv.conf ]; then
-            cp /etc/resolv.conf "$INSTALL_DIR/resolv.conf.orig"
+        if [ -L "$RESOLV_CONF" ]; then
+            readlink "$RESOLV_CONF" > "$INSTALL_DIR/resolv.conf.link"
+        elif [ -f "$RESOLV_CONF" ]; then
+            cp "$RESOLV_CONF" "$INSTALL_DIR/resolv.conf.orig"
         fi
     fi
-    if [ -L /etc/resolv.conf ]; then
+    if [ -L "$RESOLV_CONF" ]; then
         # usually systemd-resolved's stub: replace the symlink with a static file so it isn't reset
-        rm -f /etc/resolv.conf
+        rm -f "$RESOLV_CONF"
     fi
     {
         printf '%s\n' "${lines[@]}"
         echo "options timeout:2 attempts:2"
-    } > /etc/resolv.conf
+    } > "$RESOLV_CONF"
     # Best-effort: stop NetworkManager / dhcp clients from overwriting it back.
-    chattr +i /etc/resolv.conf 2>/dev/null
-    echo "DNS set (${lines[*]//nameserver /}). /etc/resolv.conf is now static/locked (chattr +i); uninstall can restore it."
+    chattr +i "$RESOLV_CONF" 2>/dev/null
+    echo "DNS set (${lines[*]//nameserver /}). ${RESOLV_CONF} is now static/locked (chattr +i); uninstall can restore it."
 }
 
 ensure_ulimits() {
     echo ""
     echo "=== Raising file descriptor limits ==="
-    if ! grep -q "^fs.file-max" /etc/sysctl.d/99-backhaul-tunnel.conf 2>/dev/null; then
-        echo "fs.file-max=2097152" >> /etc/sysctl.d/99-backhaul-tunnel.conf
+    if ! grep -q "^fs.file-max" "${SYSCTL_DIR}/99-backhaul-tunnel.conf" 2>/dev/null; then
+        echo "fs.file-max=2097152" >> "${SYSCTL_DIR}/99-backhaul-tunnel.conf"
     fi
     sysctl -w fs.file-max=2097152 > /dev/null 2>&1
 
-    if ! grep -q "backhaul-tunnel limits" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf << EOF
+    if ! grep -q "backhaul-tunnel limits" "$LIMITS_FILE" 2>/dev/null; then
+        cat >> "$LIMITS_FILE" << EOF
 
 # backhaul-tunnel limits
 root soft nofile 1048576
@@ -1148,7 +1152,7 @@ EOF
 }
 
 optimize_system() {
-    local conf="/etc/sysctl.d/99-backhaul-tunnel.conf" tmp kv key
+    local conf="${SYSCTL_DIR}/99-backhaul-tunnel.conf" tmp kv key
     local -a skipped=()
     local -a SETTINGS=(
         "net.core.default_qdisc=fq"
@@ -1196,7 +1200,7 @@ optimize_system() {
 
     if grep -q '^net.ipv4.tcp_congestion_control=bbr' "$conf"; then
         echo "BBR congestion control enabled."
-        echo "tcp_bbr" > /etc/modules-load.d/backhaul-bbr.conf 2>/dev/null
+        echo "tcp_bbr" > "${MODULES_DIR}/backhaul-bbr.conf" 2>/dev/null
     else
         echo "BBR is not available on this kernel — staying on the default congestion control."
     fi
@@ -1214,19 +1218,19 @@ optimize_system() {
 }
 
 revert_tuning() {
-    chattr -i /etc/resolv.conf 2>/dev/null
+    chattr -i "$RESOLV_CONF" 2>/dev/null
     if [ -f "$INSTALL_DIR/resolv.conf.link" ]; then
-        rm -f /etc/resolv.conf
-        ln -s "$(cat "$INSTALL_DIR/resolv.conf.link")" /etc/resolv.conf
-        echo "DNS: /etc/resolv.conf symlink restored."
+        rm -f "$RESOLV_CONF"
+        ln -s "$(cat "$INSTALL_DIR/resolv.conf.link")" "$RESOLV_CONF"
+        echo "DNS: ${RESOLV_CONF} symlink restored."
     elif [ -f "$INSTALL_DIR/resolv.conf.orig" ]; then
-        cat "$INSTALL_DIR/resolv.conf.orig" > /etc/resolv.conf
-        echo "DNS: original /etc/resolv.conf restored."
+        cat "$INSTALL_DIR/resolv.conf.orig" > "$RESOLV_CONF"
+        echo "DNS: original ${RESOLV_CONF} restored."
     fi
-    rm -f /etc/sysctl.d/99-backhaul-tunnel.conf /etc/sysctl.d/98-backhaul-ipv6.conf \
-          /etc/sysctl.d/97-backhaul-mtu.conf /etc/sysctl.d/96-backhaul-reserved.conf \
-          /etc/modules-load.d/backhaul-bbr.conf
-    sed -i '/^# backhaul-tunnel limits$/,/^\* hard nofile 1048576$/d' /etc/security/limits.conf 2>/dev/null
+    rm -f "${SYSCTL_DIR}/99-backhaul-tunnel.conf" "${SYSCTL_DIR}/98-backhaul-ipv6.conf" \
+          "${SYSCTL_DIR}/97-backhaul-mtu.conf" "${SYSCTL_DIR}/96-backhaul-reserved.conf" \
+          "${MODULES_DIR}/backhaul-bbr.conf"
+    sed -i '/^# backhaul-tunnel limits$/,/^\* hard nofile 1048576$/d' "$LIMITS_FILE" 2>/dev/null
     echo "Sysctl drop-ins and limits.conf entries removed (live values are reset at the next reboot)."
 }
 
@@ -1448,7 +1452,7 @@ manage_ports() {
     fi
 
     echo "Found config(s):"
-    choose TOML_FILE "Config" "${tomls[@]}" || return
+    choose TOML_FILE "Config" "${tomls[@]}" || return 0
 
     mapfile -t CUR_PORTS < <(sed -n '/^ports = \[/,/^\]/p' "$TOML_FILE" | grep -oE '"[^"]+"' | tr -d '"')
 
@@ -1554,7 +1558,7 @@ manage_services() {
 
     echo ""
     echo "Select a service to manage:"
-    choose SERVICE_NAME "Service" "${units[@]}" || return
+    choose SERVICE_NAME "Service" "${units[@]}" || return 0
 
     TOML_FILE=$(unit_toml "$SERVICE_NAME")
 
@@ -2037,7 +2041,7 @@ install_flow() {
 
     echo ""
     echo "Are you setting up the Iran server or the Kharej server?"
-    choose LOCAL_ROLE "Role" "Iran" "Kharej" || return
+    choose LOCAL_ROLE "Role" "Iran" "Kharej" || return 0
 
     echo ""
     echo "Choose transport (must be the SAME on the Iran server(s) and the Kharej server):"
@@ -2083,8 +2087,9 @@ install_flow() {
     echo "Token: $TOKEN"
     echo "Check: systemctl status 'backhaul-*'   (or menu option 2)"
     if [ "$TOKEN" = "123" ]; then
-        echo "(Reminder: the token is the fixed value '123' — anyone who can reach the tunnel port and guesses it"
-        echo " can register as your client. Use BACKHAUL_TOKEN='...' for a strong one, identical on all servers.)"
+        echo "(Reminder: the token is the fixed value '123' — it is the only authentication, so anyone who finds the"
+        echo " tunnel port and guesses it can connect as a client. Use BACKHAUL_TOKEN='...' for a strong one,"
+        echo " identical on all servers.)"
     fi
     if [ "$MSS_ENABLE" = "1" ]; then
         echo "MSS clamp: IPv6 MSS ${MSS_V6}, IPv4 MSS ${MSS_V4} — run this script on the OTHER server too."
