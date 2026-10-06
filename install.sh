@@ -1,24 +1,22 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v9  (data-usage control)
+# Backhaul Tunnel Manager (Iran <-> Kharej) — v8
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
 #
-# v9 changes vs v8 — everything here is about wasted / uncontrolled data usage:
-#   - No more reconnect storms: client retry_interval 1 -> 3, aggressive_pool off, systemd
-#     RestartSec 1 -> 5 (StartLimitIntervalSec moved to [Unit] where systemd actually reads it),
-#     watchdog limited to 3 restarts / 10 min per tunnel and it no longer restarts services
-#     that you stopped on purpose.
-#   - Kernel profile fixed: 128 MB buffers -> 32 MB, tcp_retries2 6 -> 8 (fewer false resets),
-#     and the sysctl keys that do not exist on Linux (net.ipv4.tcp_user_timeout,
-#     net.ipv4.tcp_low_latency) are gone. With "set -e" those made the v8 optimizer abort
-#     half-way, before anything was written to disk.
-#   - NEW "Data usage & limits" menu: monthly traffic counters per tunnel + for the whole
-#     server, an idle-traffic test, and an optional monthly quota guard that stops the
-#     tunnels when the limit is reached.
-#   - NEW "Apply data-saver fixes" menu entry: patches tunnels that are already installed
-#     (no need to re-create them).
-#   - Status page shows systemd auto-restart counts (a big number = reconnect loop).
-#   (v8 features — IPv4/IPv6 tunnel link, several Iran servers per Kharej — are unchanged.)
+# v8 changes vs v7:
+#   - IPv6 tunnel link: the tunnel between Iran server and Kharej client can now run over
+#     IPv4 OR IPv6 (you are asked during setup).
+#         Iran server  : bind_addr   = "0.0.0.0:PORT"   (IPv4)   or   "[::]:PORT"   (IPv6, dual-stack)
+#         Kharej client: remote_addr = "IP:PORT"        (IPv4)   or   "[IPv6]:PORT"
+#   - Multiple Iran servers: when setting up the Kharej server the script asks how many Iran
+#     servers you have, then for EACH one asks IPv4/IPv6, the address and the tunnel port.
+#     One client service is created per Iran server, so the Kharej server is tunnelled to
+#     all of them at the same time.
+#   - Watchdog is IPv6-aware and now matches connections by the service's own PID, so several
+#     tunnels on the same machine (even with the same port number) can't mask each other.
+#   - Fixes: "n" at the final prompts no longer exits the script (set -e), optimizer can be
+#     re-run (resolv.conf immutable flag), "Manage inbound ports" no longer corrupts the
+#     [server] header, service lists no longer break on the "●" bullet.
 #
 # Run this SEPARATELY on each server (every Iran server + the Kharej server).
 # Order: set up the Iran server(s) first, note their IP / tunnel port, then run the Kharej setup.
@@ -28,15 +26,11 @@ set -e
 REPO="Musixal/Backhaul"
 INSTALL_DIR="/root/backhaul-core"
 STATE_FILE="$INSTALL_DIR/state.env"
-FIXED_TOKEN="${BACKHAUL_TOKEN:-123}"
+FIXED_TOKEN="123"
 WATCHDOG_SCRIPT="$INSTALL_DIR/watchdog.sh"
 WATCHDOG_LOG="$INSTALL_DIR/watchdog.log"
 WATCHDOG_STATE_DIR="$INSTALL_DIR/watchdog-state"
-WATCHDOG_IDLE_THRESHOLD=60
-USAGE_SCRIPT="$INSTALL_DIR/usage.sh"
-USAGE_DIR="$INSTALL_DIR/usage"
-QUOTA_FILE="$INSTALL_DIR/quota.conf"
-QUOTA_LOCK="$USAGE_DIR/quota-exceeded"
+WATCHDOG_IDLE_THRESHOLD=30
 
 if [ "$EUID" -ne 0 ]; then
     echo "Please run as root (sudo)."
@@ -63,8 +57,7 @@ detect_public_ip6() {
 
 detect_default_iface() {
     local iface
-    iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
-    [ -z "$iface" ] && iface=$(ip -o -6 route show default 2>/dev/null | awk '{print $5}' | head -n1)
+    iface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
     [ -z "$iface" ] && iface=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
     [ -z "$iface" ] && iface="eth0"
     echo "$iface"
@@ -148,29 +141,12 @@ ask_yn() {
 }
 
 list_backhaul_units() {
-    # all installed Backhaul unit files (also the ones that are currently stopped)
-    systemctl list-unit-files --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}'
+    systemctl list-units --all --plain --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}'
 }
 
 list_tunnel_units() {
-    # tunnel services only (no MTU / watchdog / usage helper units)
-    list_backhaul_units | grep -vE '^backhaul-(mtu|watchdog|usage)\.service$' || true
-}
-
-fmt_bytes() {
-    awk -v b="${1:-0}" 'BEGIN { split("B KB MB GB TB", u, " "); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } printf "%.2f %s", b, u[i] }'
-}
-
-sum_restarts() {
-    # total systemd auto-restarts of all tunnel services (needs systemd >= 235)
-    local u n total=0
-    for u in $(list_tunnel_units); do
-        n=$(systemctl show -p NRestarts --value "$u" 2>/dev/null || true)
-        if [[ "$n" =~ ^[0-9]+$ ]]; then
-            total=$((total + n))
-        fi
-    done
-    echo "$total"
+    # tunnel services only (no MTU / watchdog helper units)
+    list_backhaul_units | grep -vE '^backhaul-(mtu|watchdog)\.service$' || true
 }
 
 # ---------- IP / port validation + formatting (IPv4 and IPv6) ----------
@@ -334,7 +310,7 @@ ensure_ulimits() {
     if ! grep -q "^fs.file-max" /etc/sysctl.d/99-backhaul-tunnel.conf 2>/dev/null; then
         echo "fs.file-max=2097152" >> /etc/sysctl.d/99-backhaul-tunnel.conf
     fi
-    sysctl -w fs.file-max=2097152 > /dev/null 2>&1 || true
+    sysctl -w fs.file-max=2097152 > /dev/null 2>&1
 
     if ! grep -q "backhaul-tunnel limits" /etc/security/limits.conf 2>/dev/null; then
         cat >> /etc/security/limits.conf << EOF
@@ -351,71 +327,7 @@ EOF
 }
 
 # ============================================================
-# Kernel network profile (shared by the optimizer and "apply fixes")
-# ============================================================
-
-tune_sysctl() {
-    local conf="/etc/sysctl.d/99-backhaul-tunnel.conf" bbr_ok=0 line
-
-    # BBR only if the kernel really offers it (try to load the module first).
-    modprobe tcp_bbr 2>/dev/null || true
-    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        bbr_ok=1
-        echo "BBR congestion control available — enabling it."
-        echo "tcp_bbr" > /etc/modules-load.d/backhaul-bbr.conf 2>/dev/null || true
-    else
-        echo "BBR module not available on this kernel — staying on the default (usually CUBIC)."
-    fi
-
-    # Changes vs v8 (all aimed at NOT wasting data):
-    #  - buffers 128 MB -> 32 MB: still plenty for ~1 Gbit x 200 ms, but huge buffers on a lossy,
-    #    long-RTT link only add queueing delay, timeouts and spurious retransmissions.
-    #  - tcp_retries2 6 -> 8: a healthy-but-lossy tunnel connection is no longer killed after ~25 s
-    #    of loss (every kill = reconnect + TLS handshakes + users re-downloading).
-    #  - removed net.ipv4.tcp_user_timeout and net.ipv4.tcp_low_latency: neither exists as a sysctl
-    #    on modern Linux; they only produced errors (and aborted the v8 script under "set -e").
-    #  - NOT set on purpose: tcp_tw_recycle (removed from kernel), tcp_tw_reuse (breaks behind NAT),
-    #    net.ipv6.conf.all.forwarding (would stop IPv6 router advertisements and can kill IPv6).
-    cat > "$conf" << EOF
-net.core.somaxconn=65535
-net.core.netdev_max_backlog=250000
-net.ipv4.ip_local_port_range=1024 65535
-net.core.rmem_max=33554432
-net.core.wmem_max=33554432
-net.ipv4.tcp_rmem=4096 87380 33554432
-net.ipv4.tcp_wmem=4096 65536 33554432
-net.ipv4.tcp_keepalive_time=60
-net.ipv4.tcp_keepalive_intvl=10
-net.ipv4.tcp_keepalive_probes=6
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_retries2=8
-net.ipv4.tcp_syn_retries=2
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_no_metrics_save=1
-net.ipv4.ip_forward=1
-fs.file-max=2097152
-EOF
-    if [ "$bbr_ok" = "1" ]; then
-        printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >> "$conf"
-    fi
-    echo "Saved to $conf (persists across reboots)."
-
-    # Apply live, one key at a time — a key that is missing on this kernel must never abort the script.
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        sysctl -w "$line" > /dev/null 2>&1 || echo "  (skipped, not supported on this kernel: ${line%%=*})"
-    done < "$conf"
-    echo "Kernel profile applied."
-    return 0
-}
-
-# ============================================================
-# System Optimizer (kernel profile + MTU + DNS + ulimits)
+# System Optimizer (BBR + network sysctl tuning + MTU + DNS + ulimits)
 # ============================================================
 
 optimize_system() {
@@ -425,7 +337,75 @@ optimize_system() {
     INTERFACE=$(detect_default_iface)
     echo "Interface: $INTERFACE"
 
-    tune_sysctl
+    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1 && echo "BBR congestion control enabled." \
+        || echo "BBR module not available on this kernel — staying on the default (usually CUBIC)."
+
+    sysctl -w net.core.somaxconn=65535 > /dev/null 2>&1
+    sysctl -w net.core.netdev_max_backlog=250000 > /dev/null 2>&1
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535" > /dev/null 2>&1
+
+    sysctl -w net.core.rmem_max=134217728 > /dev/null 2>&1
+    sysctl -w net.core.wmem_max=134217728 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" > /dev/null 2>&1
+
+    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_user_timeout=30000 > /dev/null 2>&1
+
+    sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
+
+    # Kept from the original profile — not superseded by the new list.
+    # (net.ipv4.tcp_* settings apply to IPv6 TCP sockets too.)
+    sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_timestamps=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_sack=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_retries2=6 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_syn_retries=2 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_no_metrics_save=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+
+    # Deliberately NOT set (can backfire on newer kernels / behind NAT-CGNAT):
+    #   net.ipv4.tcp_tw_recycle   (removed in modern kernels)
+    #   net.ipv4.tcp_tw_reuse=1   (can break behind NAT/CGNAT)
+    # Deliberately NOT set: net.ipv6.conf.all.forwarding (would stop the host accepting
+    # IPv6 router advertisements and can silently kill its IPv6 connectivity).
+
+    cat > /etc/sysctl.d/99-backhaul-tunnel.conf << EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=250000
+net.ipv4.ip_local_port_range=1024 65535
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=6
+net.ipv4.tcp_user_timeout=30000
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_retries2=6
+net.ipv4.tcp_syn_retries=2
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_low_latency=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.ip_forward=1
+EOF
+    echo "Saved to /etc/sysctl.d/99-backhaul-tunnel.conf (persists across reboots)."
+
     ensure_ulimits
     ensure_mtu
     ensure_dns
@@ -435,7 +415,7 @@ optimize_system() {
 }
 
 # ============================================================
-# Watchdog (health check + auto-restart, with restart-storm protection)
+# Watchdog (health check + auto-restart)
 # ============================================================
 
 setup_watchdog() {
@@ -446,78 +426,33 @@ setup_watchdog() {
     cat > "$WATCHDOG_SCRIPT" << 'WDEOF'
 #!/bin/bash
 # Backhaul watchdog — runs every 10s via backhaul-watchdog.timer
-# Restarts a tunnel only if:
-#   1) systemd reports it as "failed", OR
-#   2) it is running but has had zero established tunnel connections for IDLE_THRESHOLD
-#      seconds (link looks dead/hung).
-# Safety rails — the watchdog must never be the cause of wasted data:
-#   - "inactive" units (stopped on purpose from the menu / by the quota guard) are left alone
-#   - at most MAX_RESTARTS restarts per unit per WINDOW seconds (restart-storm protection)
-#   - nothing is touched while the quota lock exists
+# Restarts a service if:
+#   1) it is not active, OR
+#   2) it has been active but with zero established tunnel connections for
+#      IDLE_THRESHOLD seconds (link looks dead/hung).
 #
-# Works with IPv4 and IPv6 tunnels, and with several tunnel services on one machine:
-# each service is judged only by the connections that belong to its own process.
+# Works with IPv4 and IPv6 tunnels, and with several tunnel services on one machine
+# (e.g. a Kharej server connected to multiple Iran servers): each service is judged
+# only by the connections that belong to its own process.
 
 INSTALL_DIR="/root/backhaul-core"
 STATE_DIR="$INSTALL_DIR/watchdog-state"
 LOG_FILE="$INSTALL_DIR/watchdog.log"
-QUOTA_LOCK="$INSTALL_DIR/usage/quota-exceeded"
-IDLE_THRESHOLD=60
-MAX_RESTARTS=3
-WINDOW=600
+IDLE_THRESHOLD=30
 
 mkdir -p "$STATE_DIR"
 
-# The quota guard stopped the tunnels on purpose: do nothing.
-[ -f "$QUOTA_LOCK" ] && exit 0
-
-restart_allowed() {
-    local f="${STATE_DIR}/${1}.restarts" now cutoff n
-    now=$(date +%s)
-    cutoff=$((now - WINDOW))
-    if [ -f "$f" ]; then
-        awk -v c="$cutoff" '$1 >= c' "$f" > "${f}.tmp" 2>/dev/null
-        mv -f "${f}.tmp" "$f"
-    fi
-    n=$(grep -c . "$f" 2>/dev/null || true)
-    n=${n:-0}
-    if [ "$n" -ge "$MAX_RESTARTS" ]; then
-        return 1
-    fi
-    echo "$now" >> "$f"
-    return 0
-}
-
-do_restart() {
-    local unit="$1" reason="$2" now marker last
-    now=$(date +%s)
-    if restart_allowed "$unit"; then
-        systemctl restart "$unit" 2>/dev/null
-        echo "$now" > "${STATE_DIR}/${unit}.last_ok"
-        echo "$(date '+%F %T') restarted $unit ($reason)" >> "$LOG_FILE"
-    else
-        # log the back-off at most once per window so the log stays small
-        marker="${STATE_DIR}/${unit}.skip_logged"
-        last=$(cat "$marker" 2>/dev/null || echo 0)
-        if [ $(( now - last )) -ge "$WINDOW" ]; then
-            echo "$(date '+%F %T') NOT restarting $unit ($reason): already restarted ${MAX_RESTARTS}x in the last $((WINDOW / 60)) min - backing off" >> "$LOG_FILE"
-            echo "$now" > "$marker"
-        fi
-    fi
-}
-
-for unit in $(systemctl list-unit-files --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}'); do
+for unit in $(systemctl list-units --all --plain --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}'); do
     case "$unit" in
-        backhaul-mtu.service|backhaul-watchdog.service|backhaul-usage.service) continue ;;
+        backhaul-mtu.service|backhaul-watchdog.service) continue ;;
     esac
 
-    state=$(systemctl is-active "$unit" 2>/dev/null)
-    if [ "$state" = "failed" ]; then
-        do_restart "$unit" "service was in failed state"
+    if ! systemctl is-active --quiet "$unit"; then
+        systemctl restart "$unit" 2>/dev/null
+        echo "$(date '+%F %T') restarted $unit (service was inactive)" >> "$LOG_FILE"
+        rm -f "${STATE_DIR}/${unit}.last_ok"
         continue
     fi
-    # inactive = stopped on purpose, activating = systemd is already retrying -> leave it alone
-    [ "$state" = "active" ] || continue
 
     unit_file="/etc/systemd/system/${unit}"
     toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "$unit_file" 2>/dev/null | head -n1)
@@ -541,7 +476,6 @@ for unit in $(systemctl list-unit-files --no-legend 'backhaul-*.service' 2>/dev/
 
     now=$(date +%s)
     state_file="${STATE_DIR}/${unit}.last_ok"
-    [ -f "$state_file" ] || echo "$now" > "$state_file"
 
     if [ "${active_conns:-0}" -gt 0 ]; then
         echo "$now" > "$state_file"
@@ -549,7 +483,9 @@ for unit in $(systemctl list-unit-files --no-legend 'backhaul-*.service' 2>/dev/
         last_ok=$(cat "$state_file" 2>/dev/null || echo "$now")
         idle=$(( now - last_ok ))
         if [ "$idle" -ge "$IDLE_THRESHOLD" ]; then
-            do_restart "$unit" "idle ${idle}s, no established connections on port ${port}"
+            systemctl restart "$unit" 2>/dev/null
+            echo "$now" > "$state_file"
+            echo "$(date '+%F %T') restarted $unit (idle ${idle}s, no established connections on port ${port})" >> "$LOG_FILE"
         fi
     fi
 done
@@ -581,384 +517,8 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
-    echo "Watchdog installed — checks every 10s, restarts a tunnel after ${WATCHDOG_IDLE_THRESHOLD}s with no active"
-    echo "connections (max 3 restarts per 10 minutes per tunnel)."
+    echo "Watchdog installed — checks every 10s, restarts a tunnel after ${WATCHDOG_IDLE_THRESHOLD}s with no active connections."
     echo "Log: $WATCHDOG_LOG"
-}
-
-# ============================================================
-# Usage monitor + quota guard
-# ============================================================
-
-setup_usage_monitor() {
-    echo ""
-    echo "=== Installing usage monitor ==="
-    mkdir -p "$USAGE_DIR"
-
-    cat > "$USAGE_SCRIPT" << 'UEOF'
-#!/bin/bash
-# Backhaul usage monitor — runs every 60s via backhaul-usage.timer
-#  1) keeps MONTHLY traffic counters: one per tunnel service (systemd IP accounting) and one for
-#     the whole network card (this is what your provider bills)
-#  2) quota guard: if /root/backhaul-core/quota.conf sets a limit and the network card's usage for
-#     the month reaches it, ALL tunnels are stopped (the watchdog leaves them alone while the lock
-#     exists). The lock is released automatically on the 1st of the next month.
-
-INSTALL_DIR="/root/backhaul-core"
-USAGE_DIR="$INSTALL_DIR/usage"
-QUOTA_FILE="$INSTALL_DIR/quota.conf"
-QUOTA_LOCK="$USAGE_DIR/quota-exceeded"
-LOG_FILE="$INSTALL_DIR/watchdog.log"
-UINT64_MAX="18446744073709551615"
-
-mkdir -p "$USAGE_DIR"
-period=$(date +%Y-%m)
-
-tunnel_units() {
-    systemctl list-unit-files --no-legend 'backhaul-*.service' 2>/dev/null | awk '{print $1}' \
-        | grep -vE '^backhaul-(mtu|watchdog|usage)\.service$'
-}
-
-accumulate() {
-    # $1 = key, $2 = current received bytes, $3 = current sent bytes
-    local key="$1" cin="$2" cout="$3" f="$USAGE_DIR/${1}.state"
-    local p lin lout tin tout
-    if [ -f "$f" ] && read -r p lin lout tin tout < "$f" && [ -n "$tout" ]; then
-        :
-    else
-        p="$period"; lin="$cin"; lout="$cout"; tin=0; tout=0
-    fi
-    if [ "$p" != "$period" ]; then p="$period"; tin=0; tout=0; fi
-    # kernel / systemd counters restart from 0 after a reboot or a service restart
-    if [ "$cin" -ge "$lin" ]; then tin=$((tin + cin - lin)); else tin=$((tin + cin)); fi
-    if [ "$cout" -ge "$lout" ]; then tout=$((tout + cout - lout)); else tout=$((tout + cout)); fi
-    echo "$p $cin $cout $tin $tout" > "$f"
-}
-
-# ---- whole network card ----
-iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
-[ -z "$iface" ] && iface=$(ip -o -6 route show default 2>/dev/null | awk '{print $5}' | head -n1)
-if [ -n "$iface" ] && [ -r "/sys/class/net/${iface}/statistics/rx_bytes" ]; then
-    accumulate "nic" "$(cat "/sys/class/net/${iface}/statistics/rx_bytes")" "$(cat "/sys/class/net/${iface}/statistics/tx_bytes")"
-fi
-
-# ---- per tunnel service ----
-for unit in $(tunnel_units); do
-    systemctl is-active --quiet "$unit" || continue
-    vals=$(systemctl show -p IPIngressBytes -p IPEgressBytes "$unit" 2>/dev/null)
-    cin=$(echo "$vals" | sed -n 's/^IPIngressBytes=//p')
-    cout=$(echo "$vals" | sed -n 's/^IPEgressBytes=//p')
-    [[ "$cin" =~ ^[0-9]+$ ]] && [[ "$cout" =~ ^[0-9]+$ ]] || continue
-    [ "$cin" = "$UINT64_MAX" ] || [ "$cout" = "$UINT64_MAX" ] && continue
-    accumulate "$unit" "$cin" "$cout"
-done
-
-# ---- quota guard ----
-if [ -f "$QUOTA_LOCK" ]; then
-    if [ "$(cat "$QUOTA_LOCK" 2>/dev/null)" != "$period" ]; then
-        rm -f "$QUOTA_LOCK"
-        for unit in $(tunnel_units); do systemctl start "$unit" >/dev/null 2>&1; done
-        echo "$(date '+%F %T') new month: quota lock released, tunnels started" >> "$LOG_FILE"
-    fi
-    exit 0
-fi
-
-[ -f "$QUOTA_FILE" ] || exit 0
-QUOTA_GB=0
-QUOTA_COUNT=total
-. "$QUOTA_FILE"
-[[ "$QUOTA_GB" =~ ^[0-9]+$ ]] && [ "$QUOTA_GB" -gt 0 ] || exit 0
-[ -f "$USAGE_DIR/nic.state" ] || exit 0
-read -r _ _ _ tin tout < "$USAGE_DIR/nic.state" || exit 0
-if [ "$QUOTA_COUNT" = "out" ]; then used=$tout; else used=$((tin + tout)); fi
-if [ "$used" -ge $((QUOTA_GB * 1073741824)) ]; then
-    echo "$period" > "$QUOTA_LOCK"
-    echo "$(date '+%F %T') QUOTA REACHED (${QUOTA_GB} GB/month, used $((used / 1048576)) MB): stopping all tunnels" >> "$LOG_FILE"
-    for unit in $(tunnel_units); do systemctl stop "$unit" >/dev/null 2>&1; done
-fi
-exit 0
-UEOF
-    chmod +x "$USAGE_SCRIPT"
-
-    cat > /etc/systemd/system/backhaul-usage.service << EOF
-[Unit]
-Description=Backhaul usage monitor (traffic counters / quota guard)
-
-[Service]
-Type=oneshot
-ExecStart=${USAGE_SCRIPT}
-EOF
-
-    cat > /etc/systemd/system/backhaul-usage.timer << 'EOF'
-[Unit]
-Description=Run Backhaul usage monitor every 60 seconds
-
-[Timer]
-OnBootSec=30
-OnUnitActiveSec=60
-AccuracySec=1
-Unit=backhaul-usage.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now backhaul-usage.timer >/dev/null 2>&1
-    systemctl start backhaul-usage.service >/dev/null 2>&1 || true
-    echo "Usage monitor installed — counters update every 60s (see menu: Data usage & limits)."
-    echo "Note: per-tunnel counters need the tunnel services to run with IPAccounting=yes."
-    echo "      Tunnels created by v8 get that via menu option 'Apply data-saver fixes'."
-    return 0
-}
-
-show_usage() {
-    local f key p lin lout tin tout label found=0 nic
-    local QUOTA_GB=0 QUOTA_COUNT=total used limit pct
-
-    echo ""
-    echo "=== Data usage this month ($(date +%Y-%m)) ==="
-    printf '%-50s %12s %12s %12s\n' "" "Received" "Sent" "Total"
-    for f in "$USAGE_DIR"/nic.state "$USAGE_DIR"/backhaul-*.state; do
-        [ -f "$f" ] || continue
-        read -r p lin lout tin tout < "$f" || continue
-        key=$(basename "$f" .state)
-        if [ "$key" = "nic" ]; then
-            label="WHOLE SERVER (what your provider sees)"
-        else
-            label="$key"
-        fi
-        printf '%-50s %12s %12s %12s\n' "${label:0:50}" "$(fmt_bytes "$tin")" "$(fmt_bytes "$tout")" "$(fmt_bytes $((tin + tout)))"
-        found=1
-    done
-    if [ "$found" = "0" ]; then
-        echo "No counters yet — install the usage monitor (menu option 6) and check again in a few minutes."
-        return 0
-    fi
-    echo ""
-    echo "How to read this: the WHOLE SERVER row is the real network usage. Tunnel rows count every socket of"
-    echo "that service (tunnel side + user side; on the Kharej server also loopback traffic to local services),"
-    echo "so they are larger than the bytes that really cross the network. If WHOLE SERVER is much bigger than"
-    echo "what your users should consume, run the idle traffic test to find out whether the tunnel itself is wasting data."
-
-    nic="$USAGE_DIR/nic.state"
-    if [ -f "$QUOTA_FILE" ] && [ -f "$nic" ]; then
-        . "$QUOTA_FILE"
-        read -r p lin lout tin tout < "$nic" || true
-        if [ "$QUOTA_COUNT" = "out" ]; then used=$tout; else used=$((tin + tout)); fi
-        limit=$((QUOTA_GB * 1073741824))
-        pct=0
-        if [ "$limit" -gt 0 ]; then
-            pct=$((used * 100 / limit))
-        fi
-        echo ""
-        echo "Quota guard: ${QUOTA_GB} GB/month ($([ "$QUOTA_COUNT" = "out" ] && echo "outgoing only" || echo "upload + download")) — used $(fmt_bytes "$used") = ${pct}%"
-    else
-        echo ""
-        echo "Quota guard: off"
-    fi
-    if [ -f "$QUOTA_LOCK" ]; then
-        echo "STATE: limit reached — tunnels are STOPPED. Use 'Resume tunnels' or raise the quota."
-    fi
-    return 0
-}
-
-set_quota() {
-    local gb basis mode
-    echo ""
-    echo "Monthly quota guard: when this server's network usage in the current month reaches the limit,"
-    echo "ALL Backhaul tunnels on this server are stopped. They start again on the 1st of next month,"
-    echo "or when you choose 'Resume tunnels' / raise the limit."
-    read -p "Monthly limit in GB (0 = turn the guard off): " gb
-    if ! [[ "$gb" =~ ^[0-9]+$ ]]; then
-        echo "Enter a whole number."
-        return 0
-    fi
-    if [ "$gb" -eq 0 ]; then
-        rm -f "$QUOTA_FILE"
-        echo "Quota guard disabled."
-        if [ -f "$QUOTA_LOCK" ]; then
-            resume_tunnels
-        fi
-        return 0
-    fi
-    echo "How does your provider count traffic?"
-    echo "  1) upload + download"
-    echo "  2) outgoing only"
-    read -p "Enter choice [1-2] (default 1): " basis
-    case "$basis" in
-        2) mode="out" ;;
-        *) mode="total" ;;
-    esac
-    cat > "$QUOTA_FILE" << EOF
-QUOTA_GB=${gb}
-QUOTA_COUNT=${mode}
-EOF
-    if [ ! -f "$USAGE_SCRIPT" ]; then
-        setup_usage_monitor
-    fi
-    if [ -f "$QUOTA_LOCK" ]; then
-        # a new limit was set: release the lock, the monitor stops the tunnels again if still over it
-        resume_tunnels
-    fi
-    echo "Quota guard set: ${gb} GB/month (${mode}). Checked every 60 seconds."
-    return 0
-}
-
-resume_tunnels() {
-    local u
-    rm -f "$QUOTA_LOCK"
-    for u in $(list_tunnel_units); do
-        systemctl start "$u" >/dev/null 2>&1 || true
-    done
-    echo "Tunnels started (the quota guard will stop them again if the limit is still exceeded)."
-    return 0
-}
-
-reset_usage() {
-    if ask_yn "Reset all usage counters to zero?" n; then
-        rm -f "$USAGE_DIR"/*.state
-        echo "Counters reset."
-    fi
-    return 0
-}
-
-idle_test() {
-    local iface secs=30 r1 t1 r2 t2 n1 n2 din dout total rate perday
-    iface=$(detect_default_iface)
-    if [ ! -r "/sys/class/net/${iface}/statistics/rx_bytes" ]; then
-        echo "Cannot read the counters of interface ${iface}."
-        return 0
-    fi
-    echo ""
-    echo "Idle traffic test on ${iface}."
-    echo "For a meaningful result, stop/disconnect all real users and apps first, so that only the"
-    echo "tunnel itself is running. A healthy idle tunnel moves only a few hundred bytes per second."
-    read -p "Press Enter to measure for ${secs}s (Ctrl+C to cancel) " _
-    r1=$(cat "/sys/class/net/${iface}/statistics/rx_bytes")
-    t1=$(cat "/sys/class/net/${iface}/statistics/tx_bytes")
-    n1=$(sum_restarts)
-    echo "Measuring..."
-    sleep "$secs"
-    r2=$(cat "/sys/class/net/${iface}/statistics/rx_bytes")
-    t2=$(cat "/sys/class/net/${iface}/statistics/tx_bytes")
-    n2=$(sum_restarts)
-
-    din=$((r2 - r1))
-    dout=$((t2 - t1))
-    total=$((din + dout))
-    rate=$((total / secs))
-    perday=$((rate * 86400))
-
-    echo ""
-    echo "Received : $(fmt_bytes "$din")    Sent: $(fmt_bytes "$dout")    (in ${secs}s)"
-    echo "Rate     : $(fmt_bytes "$rate")/s  =  $(fmt_bytes "$perday") per day if it stayed like this"
-    echo "Tunnel auto-restarts during the test: $((n2 - n1))"
-    if [ "$rate" -gt 5120 ] || [ $((n2 - n1)) -gt 0 ]; then
-        echo ""
-        echo ">> That is more than an idle tunnel should need. Things to check:"
-        echo "   - reconnect loop?   menu 2 (auto-restarts column) and: journalctl -u 'backhaul-*' -n 50"
-        echo "   - other processes?  nethogs ${iface}   or   iftop -i ${iface}   (apt install nethogs iftop)"
-        echo "   - scanners / probes on the public inbound ports of the Iran server:  ss -tn state established | wc -l"
-        echo "   - IPv6 tunnel flapping? check that the IPv6 route/firewall is stable and the tunnel port is open"
-    else
-        echo ""
-        echo ">> Idle overhead looks fine. If the monthly total is still high, the data is real traffic"
-        echo "   (users, updates, torrents, scanners hitting your inbound ports) rather than tunnel overhead."
-    fi
-    return 0
-}
-
-usage_menu() {
-    local c
-    while true; do
-        echo ""
-        echo "=== Data usage & limits ==="
-        echo "1) Show usage this month"
-        echo "2) Idle traffic test (is the tunnel itself wasting data?)"
-        echo "3) Set / change monthly quota guard"
-        echo "4) Resume tunnels stopped by the quota guard"
-        echo "5) Reset usage counters"
-        echo "6) Install / repair usage monitor"
-        echo "0) Back"
-        read -p "Select: " c
-        case "$c" in
-            1) show_usage ;;
-            2) idle_test ;;
-            3) set_quota ;;
-            4) resume_tunnels ;;
-            5) reset_usage ;;
-            6) setup_usage_monitor ;;
-            0) return 0 ;;
-            *) echo "Invalid option." ;;
-        esac
-    done
-}
-
-# ============================================================
-# Apply the data-saver fixes to tunnels that already exist
-# ============================================================
-
-apply_fixes() {
-    local u toml unit_file n=0
-    echo ""
-    echo "=== Apply data-saver fixes to existing tunnels ==="
-    echo "This will:"
-    echo "  - client configs : aggressive_pool=false, retry_interval=3   (no constant re-dialing / TLS handshakes)"
-    echo "  - systemd units  : RestartSec=5 (was 1), StartLimitIntervalSec=0 in [Unit], IPAccounting=yes"
-    echo "  - kernel profile : 32 MB buffers, tcp_retries2=8, invalid sysctl keys removed"
-    echo "  - watchdog       : restart-storm protection (re-installed if present)"
-    echo "  - usage monitor  : monthly counters per tunnel + whole server"
-    echo "Tokens, ports, IPs and transports are NOT touched."
-    if ! ask_yn "Continue?" y; then
-        echo "Cancelled."
-        return 0
-    fi
-
-    for u in $(list_tunnel_units); do
-        unit_file="/etc/systemd/system/${u}"
-        toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "$unit_file" 2>/dev/null | head -n1 || true)
-        if [ -n "$toml" ] && [ -f "$toml" ]; then
-            sed -i -E 's/^aggressive_pool[[:space:]]*=.*/aggressive_pool = false/; s/^retry_interval[[:space:]]*=.*/retry_interval = 3/' "$toml"
-        fi
-        if [ -f "$unit_file" ]; then
-            sed -i -E 's/^RestartSec=.*/RestartSec=5/' "$unit_file"
-            # StartLimitIntervalSec is only valid in [Unit]; in [Service] systemd ignores it.
-            sed -i '/^StartLimitIntervalSec=/d' "$unit_file"
-            sed -i 's/^\[Unit\]/[Unit]\nStartLimitIntervalSec=0/' "$unit_file"
-            if ! grep -q '^IPAccounting=' "$unit_file"; then
-                sed -i 's/^\[Service\]/[Service]\nIPAccounting=yes/' "$unit_file"
-            fi
-        fi
-        n=$((n + 1))
-        echo "  patched: $u"
-    done
-    if [ "$n" -eq 0 ]; then
-        echo "  (no tunnel services found on this server — only the system parts are applied)"
-    fi
-
-    systemctl daemon-reload
-    tune_sysctl
-
-    if [ -f "$WATCHDOG_SCRIPT" ]; then
-        setup_watchdog
-    elif ask_yn "Install the watchdog (auto-restart on dead/idle tunnel, with restart-storm protection)?" n; then
-        setup_watchdog
-    fi
-    setup_usage_monitor
-
-    if [ "$n" -gt 0 ] && ask_yn "Restart the ${n} tunnel(s) now so the new settings take effect? (connections drop for a few seconds)" y; then
-        for u in $(list_tunnel_units); do
-            systemctl restart "$u" >/dev/null 2>&1 || true
-        done
-        echo "Tunnels restarted."
-    fi
-
-    echo ""
-    echo "Done. Next steps:"
-    echo "  1) Do the same on the other server (Iran <-> Kharej): both sides run their own client/server config."
-    echo "  2) Wait ~1 hour, then check menu 7 > Show usage; use 'Idle traffic test' to see the tunnel's own overhead."
-    return 0
 }
 
 # ============================================================
@@ -966,26 +526,21 @@ apply_fixes() {
 # ============================================================
 
 show_status() {
-    local units tunnel_units u toml addr state warn found_warning nrest
+    local units tunnel_units u toml addr state warn found_warning
 
     units=$(list_backhaul_units)
     tunnel_units=$(list_tunnel_units)
 
     if [ -n "$tunnel_units" ]; then
         echo ""
-        echo "=== Tunnel summary (service / state / auto-restarts / address) ==="
+        echo "=== Tunnel summary (service / state / address) ==="
         for u in $tunnel_units; do
-            toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "/etc/systemd/system/${u}" 2>/dev/null | head -n1 || true)
+            toml=$(grep -oE '/root/backhaul-core/[a-zA-Z0-9_.-]+\.toml' "/etc/systemd/system/${u}" 2>/dev/null | head -n1)
             addr=""
-            if [ -n "$toml" ]; then
-                addr=$(grep -E '^(bind_addr|remote_addr)' "$toml" 2>/dev/null | head -n1 | cut -d'"' -f2 || true)
-            fi
+            [ -n "$toml" ] && addr=$(grep -E '^(bind_addr|remote_addr)' "$toml" 2>/dev/null | head -n1 | cut -d'"' -f2)
             state=$(systemctl is-active "$u" 2>/dev/null || true)
-            nrest=$(systemctl show -p NRestarts --value "$u" 2>/dev/null || true)
-            printf '%-50s %-9s %-6s %s\n' "$u" "$state" "${nrest:--}" "$addr"
+            printf '%-55s %-10s %s\n' "$u" "$state" "$addr"
         done
-        echo "(auto-restarts = how many times systemd had to restart the service since it was started."
-        echo " A large or fast-growing number means a crash/reconnect loop, which wastes data.)"
     fi
 
     echo ""
@@ -995,7 +550,7 @@ show_status() {
     else
         for u in $units; do
             echo "--- $u ---"
-            systemctl status "$u" --no-pager -l | head -n 6 || true
+            systemctl status "$u" --no-pager -l | head -n 6
             echo ""
         done
     fi
@@ -1003,7 +558,7 @@ show_status() {
     echo "=== Recent warnings (token mismatch / connection issues) ==="
     found_warning=0
     for u in $tunnel_units; do
-        warn=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed|unreachable|refused" | tail -n 3 || true)
+        warn=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed|unreachable|refused" | tail -n 3)
         if [ -n "$warn" ]; then
             found_warning=1
             echo "--- $u ---"
@@ -1020,17 +575,11 @@ show_status() {
         echo "(or the IPv6 firewall blocks the tunnel port)."
     fi
 
-    if [ -f "$QUOTA_LOCK" ]; then
-        echo ""
-        echo "!! The monthly quota guard has stopped the tunnels (menu 7 > Resume tunnels)."
-    fi
-
     if [ -f "$WATCHDOG_LOG" ]; then
         echo ""
-        echo "=== Last 10 watchdog / quota events ==="
+        echo "=== Last 10 watchdog restarts ==="
         tail -n 10 "$WATCHDOG_LOG"
     fi
-    return 0
 }
 
 # ============================================================
@@ -1171,7 +720,7 @@ manage_services() {
         read -p "Select: " SCHOICE
         case "$SCHOICE" in
             1) systemctl start "$SERVICE_NAME"; echo "Started." ;;
-            2) systemctl stop "$SERVICE_NAME"; echo "Stopped (the watchdog leaves stopped services alone)." ;;
+            2) systemctl stop "$SERVICE_NAME"; echo "Stopped." ;;
             3) systemctl restart "$SERVICE_NAME"; echo "Restarted." ;;
             4) systemctl status "$SERVICE_NAME" --no-pager -l ;;
             5) journalctl -u "$SERVICE_NAME" -f ;;
@@ -1207,7 +756,7 @@ manage_services() {
 
 uninstall_all() {
     local units u
-    if ! ask_yn "This will remove ALL Backhaul services (including watchdog/usage/MTU units) on THIS server. Continue?" n; then
+    if ! ask_yn "This will remove ALL Backhaul services (including watchdog/MTU units) on THIS server. Continue?" n; then
         echo "Cancelled."
         return
     fi
@@ -1218,9 +767,7 @@ uninstall_all() {
         rm -f "/etc/systemd/system/$u"
     done
     systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1 || true
-    systemctl disable --now backhaul-usage.timer >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/backhaul-watchdog.timer /etc/systemd/system/backhaul-watchdog.service
-    rm -f /etc/systemd/system/backhaul-usage.timer /etc/systemd/system/backhaul-usage.service
 
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
@@ -1234,25 +781,22 @@ uninstall_all() {
 
 write_service() {
     # $1 = unit name (without .service), $2 = description, $3 = toml path
-    # RestartSec=5 (was 1): a crashing / unreachable tunnel must not re-dial and re-handshake every second.
-    # StartLimitIntervalSec belongs in [Unit] (systemd ignores it in [Service]).
     cat > "/etc/systemd/system/$1.service" << EOF
 [Unit]
 Description=$2
 After=network.target
-StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=root
 ExecStart=${INSTALL_DIR}/backhaul -c $3
 Restart=always
-RestartSec=5
+RestartSec=1
+StartLimitIntervalSec=0
 LimitNOFILE=1048576
 TasksMax=infinity
 LimitMEMLOCK=infinity
 OOMScoreAdjust=-1000
-IPAccounting=yes
 StandardOutput=journal
 StandardError=journal
 
@@ -1263,18 +807,16 @@ EOF
 
 write_client_toml() {
     # $1 = toml path, $2 = remote_addr (already formatted, IPv6 in [])
-    # aggressive_pool=false / retry_interval=3 are the official defaults: aggressive pool refilling
-    # and 1-second retries mean constant new (TLS) connections whenever the link hiccups.
     cat > "$1" << EOF
 [client]
 remote_addr = "$2"
 transport = "${TRANSPORT}"
 token = "${TOKEN}"
 connection_pool = 8
-aggressive_pool = false
+aggressive_pool = true
 keepalive_period = 20
 nodelay = true
-retry_interval = 3
+retry_interval = 1
 sniffer = false
 web_port = 0
 log_level = "warn"
@@ -1475,7 +1017,7 @@ setup_kharej_clients() {
             echo "  OK: $(format_hostport "$ip" "$port") is reachable."
         else
             echo "  Warning: $(format_hostport "$ip" "$port") is not reachable right now."
-            echo "           (Iran side not set up yet, firewall, or wrong IP version? The client keeps retrying every few seconds.)"
+            echo "           (Iran side not set up yet, firewall, or wrong IP version? The client keeps retrying every second.)"
         fi
 
         IPS+=("$ip")
@@ -1536,8 +1078,7 @@ install_flow() {
     echo ""
     echo "Choose transport (must be the SAME on the Iran server(s) and the Kharej server):"
     echo "  1) wss     - TLS encrypted, looks like HTTPS to firewalls (recommended)"
-    echo "  2) wssmux  - wss + multiplexing: many user connections share a few tunnel connections,"
-    echo "               so no TLS handshake per user connection (less overhead for many small connections)"
+    echo "  2) wssmux  - wss + multiplexing, best for many concurrent connections / high throughput"
     echo "  3) tcp     - plain TCP, fastest but not encrypted or disguised"
     echo "  4) tcpmux  - tcp + multiplexing"
     read -p "Enter choice [1-4] (default 1): " TRANSPORT_CHOICE
@@ -1550,8 +1091,8 @@ install_flow() {
 
     # Token is fixed (as requested) — same on every server, no prompt needed.
     # NOTE: this is much weaker than a random token. Anyone who guesses/knows
-    # "123" can authenticate to your tunnel. Fine for quick testing; for anything real run e.g.
-    #   BACKHAUL_TOKEN=$(openssl rand -hex 16) ./this-script.sh     (and use the SAME value on the other server)
+    # "123" can authenticate to your tunnel. Fine for quick testing, but
+    # consider a random token (openssl rand -hex 24) for anything real.
     TOKEN="$FIXED_TOKEN"
 
     ensure_backhaul_local
@@ -1578,10 +1119,6 @@ install_flow() {
     if ask_yn "Install the watchdog (auto-restart on dead/idle tunnel)?" n; then
         setup_watchdog
     fi
-
-    if ask_yn "Install the usage monitor (monthly data counters + optional quota guard)?" y; then
-        setup_usage_monitor
-    fi
 }
 
 # ============================================================
@@ -1590,18 +1127,16 @@ install_flow() {
 
 while true; do
     echo ""
-    echo "==== Backhaul Tunnel Manager (v9) ===="
+    echo "==== Backhaul Tunnel Manager (v8) ===="
     echo "1) Install / Setup tunnel (IPv4/IPv6, Kharej: multiple Iran servers)"
     echo "2) Show tunnel status"
     echo "3) Manage inbound ports (Iran side)"
     echo "4) Manage services (start/stop/restart/logs/edit)"
-    echo "5) System optimizer (kernel profile + MTU + DNS + ulimits)"
+    echo "5) System optimizer (BBR + buffers + MTU + DNS + ulimits)"
     echo "6) Install/repair Watchdog (auto-restart on dead/idle tunnel)"
-    echo "7) Data usage & limits (counters / idle test / monthly quota)"
-    echo "8) Apply data-saver fixes to existing tunnels"
-    echo "9) Uninstall tunnel"
-    echo "0) Exit"
-    read -p "Select an option [0-9]: " CHOICE
+    echo "7) Uninstall tunnel"
+    echo "8) Exit"
+    read -p "Select an option [1-8]: " CHOICE
     case "$CHOICE" in
         1) install_flow ;;
         2) show_status ;;
@@ -1609,10 +1144,8 @@ while true; do
         4) manage_services ;;
         5) optimize_system ;;
         6) setup_watchdog ;;
-        7) usage_menu ;;
-        8) apply_fixes ;;
-        9) uninstall_all ;;
-        0) exit 0 ;;
+        7) uninstall_all ;;
+        8) exit 0 ;;
         *) echo "Invalid option." ;;
     esac
 done
